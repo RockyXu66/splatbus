@@ -73,11 +73,10 @@ splatbus/
 ├── clients/                    # Viewer implementations
 │   ├── unity/                  # Unity viewer plugin
 │   └── blender/                # Blender viewer addon
-├── examples/                   # Integration examples (diff files)
-│   ├── 3DGS.diff
-│   ├── 4DGS.diff
-│   └── GaussianAvatar.diff
-└── README.md
+└── examples/                   # Integration examples (diff files)
+    ├── 3DGS.diff
+    ├── 4DGS.diff
+    └── GaussianAvatar.diff
 ```
 
 ## Examples
