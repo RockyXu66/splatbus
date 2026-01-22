@@ -1,8 +1,8 @@
 """
-Basic usage example for gs-ipc package
+Basic usage example for splatbus package
 """
 import torch
-from gs_ipc import GaussianSplattingIPCRenderer
+from splatbus import GaussianSplattingIPCRenderer
 
 def main():
     # Initialize the renderer

@@ -1,51 +1,136 @@
-# gs-ipc
+# 🚌 SplatBus
 
-IPC (Inter-Process Communication) Package for Gaussian Splatting with CUDA support.
+A Gaussian Splatting viewer framework via GPU interprocess communication for real-time rendering in external applications (e.g., Unity, Blender).
 
 ## Overview
 
-`gs-ipc` provides a high-performance IPC mechanism for sharing CUDA frame buffers between Python and Unity (or other applications) for real-time Gaussian Splatting rendering.
+`SplatBus` is a viewer framework that enables zero-copy GPU memory sharing between Python-based Gaussian Splatting renderers and external viewer applications. By leveraging CUDA IPC (Inter-Process Communication) handles, SplatBus shares GPU memory directly across processes, eliminating expensive CPU-GPU data transfers and enabling real-time interactive visualization.
+
+### Architecture
+
+```
+┌─────────────────────────────────────┐     ┌─────────────────────────────────────┐
+│         Python Renderer             │     │         Viewer (Unity/etc)          │
+│  (3DGS, 4DGS, GaussianAvatar...)    │     │                                     │
+│                                     │     │                                     │
+│  ┌─────────────────────────────┐    │     │    ┌─────────────────────────┐      │
+│  │   GaussianSplattingIPC      │    │     │    │   Viewer Application    │      │
+│  │       Renderer              │    │     │    │                         │      │
+│  └──────────┬──────────────────┘    │     │    └───────────┬─────────────┘      │
+│             │                       │     │                │                    │
+│  ┌──────────▼──────────────────┐    │     │    ┌───────────▼─────────────┐      │
+│  │  CUDAFrameBuffer (Color)    │◄───┼─────┼────┤  CUDA IPC Memory Map    │      │
+│  │  CUDAFrameBuffer (Depth)    │    │ GPU │    │  (Zero-copy access)     │      │
+│  └──────────┬──────────────────┘    │ MEM │    └───────────▲─────────────┘      │
+│             │                       │     │                │                    │
+│  ┌──────────▼──────────────────┐    │     │    ┌───────────┴─────────────┐      │
+│  │   IPCSocketServer (:6001)   │────┼─────┼───►│  Receives IPC handles   │      │
+│  │   (sends CUDA handles)      │    │ TCP │    │  & buffer metadata      │      │
+│  └─────────────────────────────┘    │     │    └─────────────────────────┘      │
+│                                     │     │                                     │
+│  ┌─────────────────────────────┐    │     │    ┌─────────────────────────┐      │
+│  │  MessageSocketServer (:6000)│◄───┼─────┼────┤  Sends camera pose &    │      │
+│  │  (receives poses)           │    │ TCP │    │  point cloud transforms │      │
+│  └─────────────────────────────┘    │     │    └─────────────────────────┘      │
+└─────────────────────────────────────┘     └─────────────────────────────────────┘
+```
 
 ## Features
 
-- **CUDA Frame Buffer Management**: GPU memory management for frame data
-- **IPC Handle Management**: Share CUDA memory across processes
-- **TCP Socket Communication**: Cross-platform inter-process communication
-- **Real-time Updates**: Optimized for low-latency frame updates
+- **Zero-Copy GPU Memory Sharing**: Direct CUDA memory sharing via IPC handles without CPU involvement
+- **Dual Buffer Architecture**: Separate color (RGBA32F) and depth (R32F) buffers for flexible rendering pipelines
+- **Bidirectional Communication**: Real-time camera pose and point cloud transform updates between renderer and viewer
+- **CUDA Event Synchronization**: Proper read/write synchronization across processes via CUDA events
+- **Easy Integration**: Simple API designed for seamless integration with existing Gaussian Splatting codebases
 
 ## Requirements
 
 - Python >= 3.8
 - PyTorch >= 2.0.0 with CUDA support
-- CUDA-capable GPU
-- Localhost TCP connectivity between apps
+- CUDA-capable GPU (the same GPU must be accessible by both renderer and viewer processes)
+- Linux (CUDA IPC is supported on Linux only)
+
+## Installation
+
+```bash
+# From source
+cd splatbus
+pip install -e .
+
+# Or directly
+pip install .
+```
+
+## Project Structure
+
+```
+splatbus/
+├── splatbus/                   # Python package (renderer side)
+│   ├── splatbus/               # Core library
+│   │   ├── core/               
+│   │   └── renderer.py         # GaussianSplattingIPCRenderer
+│   └── examples/               # Python test scripts
+├── clients/                    # Viewer implementations
+│   ├── unity/                  # Unity viewer plugin
+│   └── blender/                # Blender viewer addon
+├── examples/                   # Integration examples (diff files)
+│   ├── 3DGS.diff
+│   ├── 4DGS.diff
+│   └── GaussianAvatar.diff
+└── README.md
+```
 
 ## Examples
 
-### IPC test (Python renderer)
-
-`examples/ipc_test.py` simulates the Python renderer loop and publishes CUDA buffers.
+### Running the Test Scripts
 
 ```bash
-python examples/ipc_test.py
+# Terminal 1: Start the Python renderer (simulates Gaussian Splatting rendering)
+python splatbus/examples/ipc_test.py
+
+# Terminal 2: Start the simulated viewer
+python splatbus/examples/client_test.py
 ```
 
-### Simulated client
-
-`examples/client_test.py` connects to both channels to simulate client (e.g. Unity):
-
-- IPC channel (default `6001`): receives init packets
-- Message channel (default `6000`): sends camera and point cloud poses
-
-Run it with:
+Viewer options (Python test script):
 
 ```bash
-python examples/client_test.py
+python splatbus/examples/client_test.py \
+    --host 127.0.0.1 \
+    --ipc-port 6001 \
+    --msg-port 6000 \
+    --interval 0.1
 ```
 
-Optional flags:
+### Integration Examples
 
-```bash
-python examples/client_test.py --host 127.0.0.1 --ipc-port 6001 --msg-port 6000 --interval 0.1
+The `examples/` directory contains diff files demonstrating how to integrate SplatBus with various Gaussian Splatting implementations:
+
+- `3DGS.diff` - Integration with [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
+- `4DGS.diff` - Integration with [4D Gaussian Splatting](https://github.com/hustvl/4DGaussians)
+- `GaussianAvatar.diff` - Integration with [mmlphuman](https://github.com/1231234zhan/mmlphuman)
+
+## API Reference
+
+**GaussianSplattingIPCRenderer Methods:**
+
+- `update_frame(color_data, depth_data, inverse_depth=True)` - Update shared GPU buffers with new rendered frame
+- `update_view(view)` - Update camera view from pose received from viewer
+- `update_gaussians(gaussians)` - Update Gaussian positions from transform received from viewer
+- `close()` - Release resources and close connections
+
+## License
+
+MIT License - see [LICENSE](splatbus/LICENSE) for details.
+
+## Citation
+
+If you find SplatBus useful for your research and applications, please cite using this BibTeX:
+
+```bibtex
+@misc{placeholder,
+      title={}, 
+      author={},
+      year={},
+}
 ```
-

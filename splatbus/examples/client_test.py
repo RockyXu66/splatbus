@@ -1,5 +1,5 @@
 """
-Simulated client for gs-ipc.
+Simulated client for splatbus.
 
 Connects to both channels:
 - IPC channel (default 6001): receives init packets
@@ -52,7 +52,7 @@ def ipc_listener(sock: socket.socket, stop_event: threading.Event) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Unity client simulator for gs-ipc.")
+    parser = argparse.ArgumentParser(description="Unity client simulator for splatbus.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--ipc-port", type=int, default=6001)
     parser.add_argument("--msg-port", type=int, default=6000)
