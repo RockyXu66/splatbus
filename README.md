@@ -127,9 +127,13 @@ MIT License - see [LICENSE](splatbus/LICENSE) for details.
 If you find SplatBus useful for your research and applications, please cite using this BibTeX:
 
 ```bibtex
-@misc{placeholder,
-      title={}, 
-      author={},
-      year={},
+@misc{xu2026splatbusgaussiansplattingviewer,
+      title={SplatBus: A Gaussian Splatting Viewer Framework via GPU Interprocess Communication}, 
+      author={Yinghan Xu and Théo Morales and John Dingliana},
+      year={2026},
+      eprint={2601.15431},
+      archivePrefix={arXiv},
+      primaryClass={cs.GR},
+      url={https://arxiv.org/abs/2601.15431}, 
 }
 ```
