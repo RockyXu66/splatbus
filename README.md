@@ -85,7 +85,7 @@ splatbus/
 
 ```bash
 # Terminal 1: Start the Python renderer (simulates Gaussian Splatting rendering)
-python splatbus/examples/ipc_test.py
+python splatbus/examples/server_test.py
 
 # Terminal 2: Start the simulated viewer
 python splatbus/examples/client_test.py
