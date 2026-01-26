@@ -71,8 +71,9 @@ splatbus/
 │   │   └── renderer.py         # GaussianSplattingIPCRenderer
 │   └── examples/               # Python test scripts
 ├── clients/                    # Viewer implementations
-│   ├── unity/                  # Unity viewer plugin
-│   └── blender/                # Blender viewer addon
+│   ├── Unity-client/           # Unity viewer plugin
+│   ├── Blender-client/         # Blender viewer addon
+│   └── OpenGL-client/          # OpenGL viewer
 └── examples/                   # Integration examples (diff files)
     ├── 3DGS.diff
     ├── 4DGS.diff
