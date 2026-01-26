@@ -91,7 +91,7 @@ cp libRenderingPlugin.so ../../../../UnityProject/Assets/Plugins/x86_64/
 
 ### Connecting to SplatBus Server
 
-1. Start the SplatBus renderer server (see [ipc_test.py](https://github.com/RockyXu66/splatbus/blob/main/splatbus/examples/server_test.py) for an example)
+1. Start the SplatBus renderer server (see [server_test.py](https://github.com/RockyXu66/splatbus/blob/main/splatbus/examples/server_test.py) for an example)
    - IPC server: port `6001`
    - Pose receiver: port `6000`
 2. Run the Unity scene
