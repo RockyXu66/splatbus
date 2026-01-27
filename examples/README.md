@@ -71,4 +71,3 @@ python splatbus_renderer.py --config ./config/CONFIG_FILE.yaml --model_dir <MODE
 | `3DGS.diff` | [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) | 54c035f | ✅ |
 | `GaussianAvatar.diff` | [mmlphuman](https://github.com/1231234zhan/mmlphuman) | 6668509 | ✅ |
 | `4DGS.diff` | [4D Gaussian Splatting](https://github.com/hustvl/4DGaussians) | 63725f2 | TODO |
-| `GaussianAvatar.diff` | [mmlphuman](https://github.com/1231234zhan/mmlphuman) | 6668509 | TODO |
