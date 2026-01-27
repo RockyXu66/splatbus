@@ -1,0 +1,191 @@
+# Upstream: https://github.com/graphdeco-inria/gaussian-splatting
+# Commit: 54c035f
+diff --git a/splatbus_renderer.py b/splatbus_renderer.py
+new file mode 100644
+index 0000000..5dd9763
+--- /dev/null
++++ b/splatbus_renderer.py
+@@ -0,0 +1,182 @@
++#
++# Copyright (C) 2023, Inria
++# GRAPHDECO research group, https://team.inria.fr/graphdeco
++# All rights reserved.
++#
++# This software is free for non-commercial, research and evaluation use 
++# under the terms of the LICENSE.md file.
++#
++# For inquiries contact  george.drettakis@inria.fr
++#
++"""
++SplatBus Renderer - 3DGS Rendering
++Modified from render.py to work with SplatBus IPC pipeline
++
++Usage:
++    python splatbus_renderer.py -m <path_to_3dgs_model> --skip_test --fps 10
++"""
++
++import torch
++from scene import Scene
++import os
++from tqdm import tqdm
++from os import makedirs
++from gaussian_renderer import render
++import torchvision
++from utils.general_utils import safe_state
++from argparse import ArgumentParser
++from arguments import ModelParams, PipelineParams, get_combined_args
++from gaussian_renderer import GaussianModel
++try:
++    from diff_gaussian_rasterization import SparseGaussianAdam
++    SPARSE_ADAM_AVAILABLE = True
++except:
++    SPARSE_ADAM_AVAILABLE = False
++
++from contextlib import suppress
++import time
++from loguru import logger
++from splatbus import GaussianSplattingIPCRenderer
++
++ipc_render = GaussianSplattingIPCRenderer()
++
++logger.info("=" * 60)
++logger.info("SplatBus Renderer - 3D Gaussian Splatting")
++logger.info("=" * 60)
++
++
++def render_set(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh):
++    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
++    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
++
++    makedirs(render_path, exist_ok=True)
++    makedirs(gts_path, exist_ok=True)
++
++    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
++        rendering = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
++        gt = view.original_image[0:3, :, :]
++
++        if train_test_exp:
++            rendering = rendering[..., rendering.shape[-1] // 2:]
++            gt = gt[..., gt.shape[-1] // 2:]
++
++        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
++        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
++
++
++def loop_render(model_path, name, iteration, views, gaussians, pipeline, background, train_test_exp, separate_sh, fps):
++    """
++    Render loop function: continuously render and send to viewer via IPC
++    """
++
++    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
++    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
++
++    makedirs(render_path, exist_ok=True)
++    makedirs(gts_path, exist_ok=True)
++    
++    view_idx = 0
++
++    logger.info(f'Render with {fps} FPS.')
++     
++    pbar = tqdm(desc="Rendering", unit=" frame", dynamic_ncols=True)
++
++    cam_info = views[view_idx]
++    # logger.info(f'views[{view_idx}]:')
++    # logger.info(f'FoVx: {cam_info.FoVx}')
++    # logger.info(f'FoVy: {cam_info.FoVy}')
++    # logger.info(f'Camera Center: {cam_info.camera_center}')
++    # logger.info(f'R: {cam_info.R}')
++    # logger.info(f'T: {cam_info.T}')
++    # logger.info(f'Full proj: {cam_info.full_proj_transform}')
++    # logger.info(f'Proj max: {cam_info.projection_matrix}')
++    # logger.info(f'world view transform: {cam_info.world_view_transform}')
++
++    target_frame_time = 1.0 / fps
++
++    try:
++        while True:
++            loop_start_time = time.time()
++            if view_idx >= len(views):
++                logger.error(f'view_idx {view_idx} out of range of {len(views)} views.')
++                break
++            view = views[view_idx]
++
++            view.image_height = ipc_render.height
++            view.image_width = ipc_render.width
++
++            # Update the view and gaussians
++            ipc_render.update_view(view)
++            ipc_render.update_gaussians(gaussians)
++
++            # Render the current view
++            rendering = render(view, gaussians, pipeline, background, 
++                             use_trained_exp=train_test_exp, 
++                             separate_sh=separate_sh)
++            
++            # Update IPC buffers
++            ipc_render.update_frame(rendering["render"], rendering["depth"])
++
++            # Uncomment to debug rendering results
++            # torchvision.utils.save_image(rendering['render'], os.path.join(render_path, '{0:05d}'.format(view_idx) + ".png"))
++            # torchvision.utils.save_image(rendering['depth'], os.path.join(render_path, '{0:05d}_depth'.format(view_idx) + ".png"))
++             
++            # Control FPS
++            elapsed_time = time.time() - loop_start_time
++            sleep_time = target_frame_time - elapsed_time
++            if sleep_time > 0:
++                time.sleep(sleep_time)
++
++            pbar.update(1)
++        
++        ipc_render.close()
++            
++    except KeyboardInterrupt:
++        logger.info("\n\n Stopping render loop... \n\n")
++    except Exception:
++        logger.exception("\n\n ERROR in render loop")
++        raise
++    finally:
++        pbar.close()
++        with suppress(Exception):
++            ipc_render.close()
++
++
++def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, skip_test: bool, separate_sh: bool, fps: int):
++    with torch.no_grad():
++        gaussians = GaussianModel(dataset.sh_degree)
++        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
++
++        # tmp_path = os.getcwd() + '/test.ply'
++        # gaussians.save_vanilla_ply(tmp_path)
++
++        bg_color = [1,1, 1] if dataset.white_background else [0, 0, 0]
++        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
++
++        if not skip_test:
++            print("\nRendering test set to files...")
++            render_set(dataset.model_path, "test", scene.loaded_iter, 
++                      scene.getTestCameras(), gaussians, pipeline, 
++                      background, dataset.train_test_exp, separate_sh)
++        
++        loop_render(dataset.model_path, "test", scene.loaded_iter, 
++                   scene.getTestCameras(), gaussians, pipeline, 
++                   background, dataset.train_test_exp, separate_sh, fps)
++
++
++if __name__ == "__main__":
++    # Set up command line argument parser
++    parser = ArgumentParser(description="SplatBus Renderer - 3DGS Rendering")
++    model = ModelParams(parser, sentinel=True)
++    pipeline = PipelineParams(parser)
++    parser.add_argument("--iteration", default=-1, type=int)
++    parser.add_argument("--skip_test", action="store_true")
++    parser.add_argument("--quiet", action="store_true")
++    parser.add_argument("--fps", default=30, type=int)
++    args = get_combined_args(parser)
++    
++    logger.info(f"\n Loading model from: {args.model_path}")
++
++    safe_state(args.quiet)
++
++    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_test, SPARSE_ADAM_AVAILABLE, args.fps)
+\ No newline at end of file
