@@ -53,6 +53,14 @@ cd /path/to/gaussian-splatting
 python splatbus_renderer.py -m <path_to_model> --skip_test --fps 10
 ```
 </details>
+<details>
+<summary>GaussianAvatar example command</summary>
+
+```bash
+cd /path/to/mmlphuman
+python splatbus_renderer.py --config ./config/CONFIG_FILE.yaml --model_dir <MODEL_DIR> --out_dir <IMAGE_OUT_DIR> --cam_path <CAM_PATH> --pose_path <POSE_PATH> --fps 30 --test
+```
+</details>
 
 4. Run your viewer client (Unity/Blender/OpenGL) to view the rendering results.
 
@@ -61,5 +69,6 @@ python splatbus_renderer.py -m <path_to_model> --skip_test --fps 10
 | Diff file | Original project | Commit SHA | Available |
 | --- | --- | --- | --- |
 | `3DGS.diff` | [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting) | 54c035f | ✅ |
+| `GaussianAvatar.diff` | [mmlphuman](https://github.com/1231234zhan/mmlphuman) | 6668509 | ✅ |
 | `4DGS.diff` | [4D Gaussian Splatting](https://github.com/hustvl/4DGaussians) | 63725f2 | TODO |
 | `GaussianAvatar.diff` | [mmlphuman](https://github.com/1231234zhan/mmlphuman) | 6668509 | TODO |
