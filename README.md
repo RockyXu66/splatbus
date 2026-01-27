@@ -45,10 +45,10 @@ A Gaussian Splatting viewer framework via GPU interprocess communication for rea
 
 ## Requirements
 
-- Python >= 3.8
 - PyTorch >= 2.0.0 with CUDA support
 - CUDA-capable GPU (the same GPU must be accessible by both renderer and viewer processes)
 - Linux (CUDA IPC is supported on Linux only)
+- Windows (Under development; stay tuned.)
 
 ## Installation
 
@@ -60,6 +60,16 @@ pip install -e .
 # Or directly
 pip install .
 ```
+
+### Renderer (server)
+
+See [**instructions**](https://github.com/RockyXu66/splatbus/tree/main/examples) to run SplatBus with various Gaussian Splatting examples (3D/4D/Avatar).
+
+### Viewer (client)
+
+See [**instructions**](https://github.com/RockyXu66/splatbus/tree/main/clients/Unity-client) to run Unity viewer.
+
+Blender viewer and OpenGL viewer coming soon...
 
 ## Project Structure
 
