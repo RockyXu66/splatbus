@@ -1,6 +1,21 @@
 # 🚌 SplatBus
 
+### [Paper](https://arxiv.org/abs/2601.15431)
+
 A Gaussian Splatting viewer framework via GPU interprocess communication for real-time rendering in external applications (e.g., Unity, Blender).
+
+## Screenshots
+<div align="center">
+  <img src="assets/unity-screenshot-3dgs.png" alt="Unity 3DGS demo" width="70%"/>
+  <br/>
+  <em>Unity plugin visualizing real-time 3D Gaussian Splatting results with interactive point clouds and 3D meshes.</em>
+</div>
+<br/>
+<div align="center">
+  <img src="assets/unity-screenshot-mmlphuman.png" alt="Unity mmlphuman demo" width="70%"/>
+  <br/>
+  <em>Unity plugin visualizing real-time Gaussian avatar with 3D meshes.</em>
+</div>
 
 ## Overview
 
