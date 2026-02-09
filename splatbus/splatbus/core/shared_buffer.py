@@ -1,7 +1,7 @@
 import torch
 from loguru import logger
 
-class CUDAFrameBuffer:
+class SharedBuffer:
     """ Manage CUDA shared memory """
 
     def __init__(self, width: int, height: int, channels: int = 4, dtype=torch.float32) -> None:
@@ -23,7 +23,7 @@ class CUDAFrameBuffer:
         self.ptr = self.buffer.data_ptr()
         self.pitch = width * channels * self.buffer.element_size()
         
-        logger.info(f"[CUDAFrameBuffer] Created buffer: {width}x{height}x{channels}, pitch={self.pitch} bytes, ptr=0x{self.ptr:x}")
+        logger.info(f"[SharedBuffer] Created buffer: {width}x{height}x{channels}, pitch={self.pitch} bytes, ptr=0x{self.ptr:x}")
     
     def update(self, image_data: torch.Tensor, inverse: bool = False):
         """
@@ -36,7 +36,7 @@ class CUDAFrameBuffer:
         
         # Debug logging
         if self.update_count < 2:
-            logger.info(f"[CUDAFrameBuffer] Update #{self.update_count} (inverse={inverse})")
+            logger.info(f"[SharedBuffer] Update #{self.update_count} (inverse={inverse})")
             logger.info(f"  Input shape: {image_data.shape}, dtype: {image_data.dtype}")
             logger.info(f"  Input range: [{image_data.min():.6f}, {image_data.max():.6f}]")
 
