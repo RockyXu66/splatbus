@@ -34,8 +34,8 @@ A Gaussian Splatting viewer framework via GPU interprocess communication for rea
 │  └──────────┬──────────────────┘    │     │    └───────────┬─────────────┘      │
 │             │                       │     │                │                    │
 │  ┌──────────▼──────────────────┐    │     │    ┌───────────▼─────────────┐      │
-│  │  SharedBuffer (Color)    │◄───┼─────┼────┤  CUDA IPC Memory Map    │      │
-│  │  SharedBuffer (Depth)    │    │ GPU │    │  (Zero-copy access)     │      │
+│  │  SharedBuffer (Color)       │◄───┼─────┼────┤  CUDA IPC Memory Map    │      │
+│  │  SharedBuffer (Depth)       │    │ GPU │    │  (Zero-copy access)     │      │
 │  └──────────┬──────────────────┘    │ MEM │    └───────────▲─────────────┘      │
 │             │                       │     │                │                    │
 │  ┌──────────▼──────────────────┐    │     │    ┌───────────┴─────────────┐      │
