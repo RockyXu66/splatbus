@@ -2,7 +2,7 @@
 
 import torch
 
-from .core.cuda_buffer import CUDAFrameBuffer
+from .core.shared_buffer import SharedBuffer
 from .core.ipc_handles import IPCHandleManager
 from .core.ipc_channel import IPCSocketServer
 from .core.message_channel import MessageSocketServer
@@ -26,8 +26,8 @@ class GaussianSplattingIPCRenderer:
 
         self.ipc_server = IPCSocketServer(host=ipc_host, port=ipc_port)
         self.msg_server = MessageSocketServer(host=msg_host, port=msg_port)
-        self.color_buffer = CUDAFrameBuffer(self.width, self.height, channels=4)
-        self.depth_buffer = CUDAFrameBuffer(self.width, self.height, channels=1)
+        self.color_buffer = SharedBuffer(self.width, self.height, channels=4)
+        self.depth_buffer = SharedBuffer(self.width, self.height, channels=1)
         self.ipc = IPCHandleManager(self.color_buffer, self.depth_buffer)
 
         # Wait for Unity client and send the initial packet
