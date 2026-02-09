@@ -45,7 +45,8 @@ def render_set(views, gaussians, pipeline, background):
             rendering = render(view[1].cuda(), gaussians, pipeline, background)[
                 "render"
             ]
-            depth_data = torch.zero_like(rendering)
+            # rendering = rendering[:, :948, :532]
+            depth_data = torch.zeros_like(rendering)
             assert rendering.shape[0] == 3, "Expected rendering to have shape (3, H, W)"
             ipc_server.update_frame(
                 color_data=rendering, depth_data=None, inverse_depth=False

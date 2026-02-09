@@ -12,7 +12,6 @@ from imgui_bundle import hello_imgui, imgui, implot
 from moderngl_window.integrations.imgui_bundle import ModernglWindowRenderer
 from pyrr import Matrix44, Quaternion, Vector3
 from rich.console import Console
-
 from splatbus import GaussianSplattingIPCClient
 
 console = Console()
@@ -34,7 +33,7 @@ class Controller(enum.Enum):
 
 @dataclass
 class HistData:
-    data: np.ndarray = np.zeros(1000, dtype=np.float32)
+    # data: np.ndarray = np.zeros(1000, dtype=np.float32)
     mean: float = 0.0
     std: float = 0.0
     min: float = 0.0
@@ -45,28 +44,28 @@ class HistData:
 class RadianceView(mglw.WindowConfig):
     gl_version = (3, 3)
     title = "RadianceViewer"
-    window_size = (1352, 1014)
+    # window_size = (1352, 1014)
+    window_size = (532,948)
     aspect_ratio = None
     resizable = True
 
-    def __init__(self, sys_argv, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        
-        self.client = GaussianSplattingIPCRenderer(
-            host="127.0.0.1",
-            ipc_port="6001",
-            msg_port="600"
+        self.client = GaussianSplattingIPCClient(
+            host="127.0.0.1", ipc_port="6001", msg_port="600"
         )
         self.width, self.height = self.window_size
-        self.time_range = self.user_context["time_range"]
-        self.scene_bounds = self.user_context["scene_bounds"]
+        self.time_range = (0, 10.0)  # self.user_context["time_range"]
+        self.scene_bounds = 20  # self.user_context["scene_bounds"]
 
         self.controller_choice = Controller.ORBIT
         self.panning_dir = 1
 
         # ======= Controls
-        R, t = self.viewpoint_cam.R, self.viewpoint_cam.T
+        # R, t = self.viewpoint_cam.R, self.viewpoint_cam.T
+        R = np.eye(3, dtype=np.float32)
+        t = np.zeros(3, dtype=np.float32)
         self.right = R[:, 0]
         self.up = R[:, 1]
         self.forward = R[:, 2]
@@ -360,6 +359,7 @@ class RadianceView(mglw.WindowConfig):
         self.plot_data = recurse(self.plot_data)
 
     def _update_timestamp(self, frame_time: float):
+        return
         if not self.paused:
             self.viewpoint_cam.timestamp += frame_time * self.time_speed
             if self.viewpoint_cam.timestamp > self.time_range[1]:
@@ -376,16 +376,21 @@ class RadianceView(mglw.WindowConfig):
             # self.viewpoint_cam.set_rt(R, t)
             self.client.send_camera_pose(
                 position={"x": 0.1 * t, "y": 0.0, "z": 1.5},
-                rotation={"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
+                rotation={"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
             )
             # image = viewer_rendering.render_frame(
             #     self.user_context, self.viewpoint_cam.timestamp, self.viewpoint_cam
             # )
             image = self.client.receive()
-            assert "color" in image
+            if "color" not in image:
+                image = {
+                    "color": torch.zeros(3, self.height, self.width, dtype=torch.uint8)
+                }
 
         # Map PBO and write data
-        self.pbo.write(image["color"].cpu().numpy().tobytes()) # TODO: windowtensor thing
+        self.pbo.write(
+            image["color"].cpu().numpy().tobytes()
+        )  # TODO: windowtensor thing
         # Bind PBO to texture
         self.texture.write(self.pbo)
         # Render quad
@@ -482,7 +487,7 @@ class RadianceView(mglw.WindowConfig):
 
         imgui.new_frame()
         if imgui.begin("Inspection", True):
-            imgui.text(f"Timestamp: {self.viewpoint_cam.timestamp:.2f}s")
+            # imgui.text(f"Timestamp: {self.viewpoint_cam.timestamp:.2f}s")
             imgui.text(
                 f"Active Gaussians: {millify(self.plot_data['active_guassians'])}/{millify(self.gaussians.xyz.shape[0])}"
             )
@@ -510,14 +515,15 @@ class RadianceView(mglw.WindowConfig):
 
 if __name__ == "__main__":
     mglw.setup_basic_logging(20)  # INFO level
-    window_cls = mglw.get_local_window_cls("glfw")  # or 'glfw', 'sdl2'
-    window = window_cls(
-        title="Radiance View",
-        size=(1280, 720),
-        fullscreen=False,
-        resizable=True,
-        gl_version=(3, 3),
-        vsync=True,
-    )
-    window.config = RadianceView(sys.argv[1:], ctx=window.ctx, wnd=window)
-    window.run()
+    # window_cls = mglw.get_local_window_cls("glfw")  # or 'glfw', 'sdl2'
+    # window = window_cls(
+    #     title="Radiance View",
+    #     size=(1280, 720),
+    #     fullscreen=False,
+    #     resizable=True,
+    #     gl_version=(3, 3),
+    #     vsync=True,
+    # )
+    # window.config = RadianceView(sys.argv[1:], ctx=window.ctx, wnd=window)
+    # window.run()
+    mglw.run_window_config(RadianceView)
