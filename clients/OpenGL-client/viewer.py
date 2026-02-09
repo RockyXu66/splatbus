@@ -13,6 +13,8 @@ from moderngl_window.integrations.imgui_bundle import ModernglWindowRenderer
 from pyrr import Matrix44, Quaternion, Vector3
 from rich.console import Console
 
+from splatbus import GaussianSplattingIPCClient
+
 console = Console()
 
 
@@ -50,6 +52,12 @@ class RadianceView(mglw.WindowConfig):
     def __init__(self, sys_argv, **kwargs):
         super().__init__(**kwargs)
 
+        
+        self.client = GaussianSplattingIPCRenderer(
+            host="127.0.0.1",
+            ipc_port="6001",
+            msg_port="600"
+        )
         self.width, self.height = self.window_size
         self.time_range = self.user_context["time_range"]
         self.scene_bounds = self.user_context["scene_bounds"]
@@ -365,13 +373,19 @@ class RadianceView(mglw.WindowConfig):
         #     self._move_collection_to_cpu()
         with torch.no_grad():
             R, t, trans = self.get_rt()
-            self.viewpoint_cam.set_rt(R, t)
-            image = viewer_rendering.render_frame(
-                self.user_context, self.viewpoint_cam.timestamp, self.viewpoint_cam
+            # self.viewpoint_cam.set_rt(R, t)
+            self.client.send_camera_pose(
+                position={"x": 0.1 * t, "y": 0.0, "z": 1.5},
+                rotation={"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}
             )
+            # image = viewer_rendering.render_frame(
+            #     self.user_context, self.viewpoint_cam.timestamp, self.viewpoint_cam
+            # )
+            image = self.client.receive()
+            assert "color" in image
 
         # Map PBO and write data
-        self.pbo.write(image.tobytes())
+        self.pbo.write(image["color"].cpu().numpy().tobytes()) # TODO: windowtensor thing
         # Bind PBO to texture
         self.texture.write(self.pbo)
         # Render quad
