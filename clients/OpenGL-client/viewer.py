@@ -53,8 +53,12 @@ class RadianceView(mglw.WindowConfig):
         super().__init__(**kwargs)
 
         self.client = GaussianSplattingIPCClient(
-            host="127.0.0.1", ipc_port="6001", msg_port="600"
+            host="127.0.0.1", ipc_port=6001, msg_port=6000
         )
+        try:
+            self.client.connect()
+        except Exception as e:
+            raise RuntimeError(f"Failed to connect to Gaussian Splatting IPC Server: {e}")
         self.width, self.height = self.window_size
         self.time_range = (0, 10.0)  # self.user_context["time_range"]
         self.scene_bounds = 20  # self.user_context["scene_bounds"]

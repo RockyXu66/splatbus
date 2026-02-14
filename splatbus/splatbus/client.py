@@ -43,25 +43,30 @@ class GaussianSplattingIPCClient:
             self.ipc_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.ipc_sock.connect((self.host, self.ipc_port))
             logger.info(f"[IPCClient] Connected to IPC {self.host}:{self.ipc_port}")
+        except Exception as e:
+            logger.error(f"[IPCClient] Connection to IPC failed: {e}")
+            self.close()
+            raise e
             
-            # Start IPC listener thread
-            self.ipc_thread = threading.Thread(
-                target=self._ipc_listener, 
-                daemon=True
-            )
-            self.ipc_thread.start()
+        # Start IPC listener thread
+        self.ipc_thread = threading.Thread(
+            target=self._ipc_listener, 
+            daemon=True
+        )
+        self.ipc_thread.start()
             
+        try:
             # Connect Message socket
             self.msg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.msg_sock.connect((self.host, self.msg_port))
             logger.info(f"[IPCClient] Connected to MSG {self.host}:{self.msg_port}")
             
             self.connected = True
-            
         except Exception as e:
-            logger.error(f"[IPCClient] Connection failed: {e}")
+            logger.error(f"[IPCClient] Connection to MSG failed: {e}")
             self.close()
             raise e
+            
 
     def _send_json(self, sock: socket.socket, payload: dict) -> None:
         if not sock:

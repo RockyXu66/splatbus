@@ -9,10 +9,11 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import signal
 import sys
 from argparse import ArgumentParser
 
+# from splatbus import GaussianSplattingIPCRenderer
+import splatbus
 import torch
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import GaussianModel, render
@@ -21,37 +22,45 @@ from omegaconf.dictconfig import DictConfig
 from scene import Scene
 from utils.general_utils import safe_state
 
-from splatbus import GaussianSplattingIPCRenderer
-
-running = True
-
-
-def signal_handler(sig, frame):
-    global running
-    print("Exiting...")
-    running = False
-
-
-signal.signal(signal.SIGINT, signal_handler)
+# running = True
+#
+#
+# def signal_handler(sig, frame):
+#     global running
+#     print("Exiting...")
+#     running = False
+#
+#
+# signal.signal(signal.SIGINT, signal_handler)
 
 
 def render_set(views, gaussians, pipeline, background):
     global running
-    ipc_server = GaussianSplattingIPCRenderer()
-    
+    print(views[0][0].shape)
+    width, height = views[0][0].shape[2], views[0][0].shape[1]
+    ipc_server = splatbus.GaussianSplattingIPCRenderer(
+        width,
+        height,
+        ipc_host="0.0.0.0",
+        msg_host="0.0.0.0",
+        ipc_port=6001,
+        msg_port=6000,
+    )
 
-    while running:
+    while True:
         for view in views:
+            # if not running:
+            #     break
             rendering = render(view[1].cuda(), gaussians, pipeline, background)[
                 "render"
             ]
-            # rendering = rendering[:, :948, :532]
-            depth_data = torch.zeros_like(rendering)
+            depth_data = torch.zeros_like(rendering)[0][None, ...]
             assert rendering.shape[0] == 3, "Expected rendering to have shape (3, H, W)"
             ipc_server.update_frame(
-                color_data=rendering, depth_data=None, inverse_depth=False
+                color_data=rendering, depth_data=depth_data, inverse_depth=False
             )
     ipc_server.close()
+
 
 def render_sets(
     dataset: ModelParams,

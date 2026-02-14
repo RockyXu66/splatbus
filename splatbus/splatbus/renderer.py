@@ -11,15 +11,15 @@ from .core.message_channel import MessageSocketServer
 class GaussianSplattingIPCRenderer:
     def __init__(
         self,
+        width: int,
+        height: int,
         ipc_host: str = "127.0.0.1",
         ipc_port: int = 6001,
         msg_host: str = "127.0.0.1",
         msg_port: int = 6000,
     ) -> None:
-        self.width = 532
-        self.height = 948
-        # self.width = 1064
-        # self.height = 1895
+        self.width = width
+        self.height = height
         
         # Set True to force a synthetic depth pattern (useful for Unity-side debugging).
         self.use_test_depth = False
