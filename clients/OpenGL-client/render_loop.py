@@ -54,8 +54,12 @@ def render_set(views, gaussians, pipeline, background):
             rendering = render(view[1].cuda(), gaussians, pipeline, background)[
                 "render"
             ]
+            # TODO: Accept channels=3. For now we'll padd alpha to 1:
+            if rendering.shape[0] == 3:
+                alpha_channel = torch.ones_like(rendering[0:1, ...])
+                rendering = torch.cat([rendering, alpha_channel], dim=0)
             depth_data = torch.zeros_like(rendering)[0][None, ...]
-            assert rendering.shape[0] == 3, "Expected rendering to have shape (3, H, W)"
+            assert rendering.shape[0] == 4, "Expected rendering to have shape (4, H, W)"
             ipc_server.update_frame(
                 color_data=rendering, depth_data=depth_data, inverse_depth=False
             )

@@ -1,6 +1,5 @@
 import enum
 import math
-import sys
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -45,7 +44,7 @@ class RadianceView(mglw.WindowConfig):
     gl_version = (3, 3)
     title = "RadianceViewer"
     # window_size = (1352, 1014)
-    window_size = (532,948)
+    window_size = (1600, 900)
     aspect_ratio = None
     resizable = True
 
@@ -58,7 +57,9 @@ class RadianceView(mglw.WindowConfig):
         try:
             self.client.connect()
         except Exception as e:
-            raise RuntimeError(f"Failed to connect to Gaussian Splatting IPC Server: {e}")
+            raise RuntimeError(
+                f"Failed to connect to Gaussian Splatting IPC Server: {e}"
+            )
         self.width, self.height = self.window_size
         self.time_range = (0, 10.0)  # self.user_context["time_range"]
         self.scene_bounds = 20  # self.user_context["scene_bounds"]
@@ -141,6 +142,7 @@ class RadianceView(mglw.WindowConfig):
         self.texture = self.ctx.texture((self.width, self.height), 3)
         self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
         # PBO for async upload
+        print(f"Creating PBO with size: {self.width}x{self.height}x3")
         self.pbo = self.ctx.buffer(reserve=self.width * self.height * 3)
         self.pbo.orphan()  # hint that data will be frequently updated
         self._frames, self._export_n_frames = [], 500
@@ -379,7 +381,7 @@ class RadianceView(mglw.WindowConfig):
             R, t, trans = self.get_rt()
             # self.viewpoint_cam.set_rt(R, t)
             self.client.send_camera_pose(
-                position={"x": 0.1 * t, "y": 0.0, "z": 1.5},
+                position={"x": 0.1, "y": 0.0, "z": 1.5},
                 rotation={"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
             )
             # image = viewer_rendering.render_frame(
@@ -388,16 +390,18 @@ class RadianceView(mglw.WindowConfig):
             image = self.client.receive()
             if "color" not in image:
                 image = {
-                    "color": torch.zeros(3, self.height, self.width, dtype=torch.uint8)
+                    "color": torch.zeros(self.height, self.width, 4, dtype=torch.uint8)
                 }
 
         # Map PBO and write data
-        self.pbo.write(
-            image["color"].cpu().numpy().tobytes()
-        )  # TODO: windowtensor thing
-        # Bind PBO to texture
+        img = image["color"].cpu().numpy()
+        assert img.shape == (self.height, self.width, 4), (
+            f"Warning: Expected image shape ({self.height}, {self.width}, 4), got {img.shape}"
+        )
+        img = (img[:, :, :3] * 255.0).astype(np.uint8)  # Ensure uint8 format
+        self.pbo.write(img.tobytes())  # TODO: windowtensor thing
         self.texture.write(self.pbo)
-        # Render quad
+
         self.ctx.clear(0.0, 0.0, 0.0, 1.0)
         self.texture.use()
         self.vao.render(moderngl.TRIANGLE_STRIP)
