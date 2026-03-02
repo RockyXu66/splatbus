@@ -85,12 +85,6 @@ class RadianceView(mglw.WindowConfig):
         self.pitch = 0.0
         # self.yaw = np.arctan2(R[1, 2], R[2, 2])
         # self.pitch = np.arcsin(-R[2, 2])
-        self.slam_alignement = None
-        self.slam_pose = np.eye(4, dtype=np.float32)
-        self.slam_pose_init = None
-        self.slam_trans_app = None
-        self.R_slam = None
-        self.slam_pose_prev = None
         self.paused = False
         # self.canonical_t = t
         self.speed = 0.1
@@ -299,37 +293,25 @@ class RadianceView(mglw.WindowConfig):
 
     # --- Get R and t ---
     def get_rt(self):
-        if self.controller_choice in [Controller.KEYBOARD_MOUSE, Controller.ORBIT]:
-            # R = Matrix44.from_eulers([self.pitch, self.yaw, 0.0])[:3, :3]
-            yaw_delta = self.yaw
-            pitch_delta = self.pitch
+        # R = Matrix44.from_eulers([self.pitch, self.yaw, 0.0])[:3, :3]
+        yaw_delta = self.yaw
+        pitch_delta = self.pitch
 
-            # R_yaw = Matrix44.from_axis_rotation(Vector3(self.up), yaw_delta)
-            # R_pitch = Matrix44.from_axis_rotation(Vector3(self.right), pitch_delta)
-            # R_keyboard = R_yaw @ R_pitch
-            q_yaw = Quaternion.from_axis_rotation(Vector3(self.up), yaw_delta)
-            q_pitch = Quaternion.from_axis_rotation(-Vector3(self.right), pitch_delta)
+        # R_yaw = Matrix44.from_axis_rotation(Vector3(self.up), yaw_delta)
+        # R_pitch = Matrix44.from_axis_rotation(Vector3(self.right), pitch_delta)
+        # R_keyboard = R_yaw @ R_pitch
+        q_yaw = Quaternion.from_axis_rotation(Vector3(self.up), yaw_delta)
+        q_pitch = Quaternion.from_axis_rotation(-Vector3(self.right), pitch_delta)
 
-            # combine: yaw first, then pitch
-            q_total = (
-                q_yaw * q_pitch
-            )  # quaternion multiplication applies pitch after yaw
+        # combine: yaw first, then pitch
+        q_total = q_yaw * q_pitch  # quaternion multiplication applies pitch after yaw
 
-            # convert to rotation matrix
-            R_keyboard = Matrix44.from_quaternion(q_total)[:3, :3]
-            R = R_keyboard @ self.R_init
-            t = self.position
-            # print(t, self.canonical_pose[:3, 3])
-            trans = np.array([0.0, 0.0, 0.0])
-        elif self.controller_choice == Controller.SLAM:
-            R = self.canonical_pose[:3, :3] @ self.slam_pose[:3, :3].T
-            t = (self.scaling_factor * self.slam_pose[:3, 3]) + self.canonical_pose[
-                :3, 3
-            ]
-            trans = np.array([0.0, 0.0, 0.0])
-
-        else:
-            raise ValueError("Unknown controller choice")
+        # convert to rotation matrix
+        R_keyboard = Matrix44.from_quaternion(q_total)[:3, :3]
+        R = R_keyboard @ self.R_init
+        t = self.position
+        # print(t, self.canonical_pose[:3, 3])
+        trans = np.array([0.0, 0.0, 0.0])
         return R, t, trans
 
     def _move_collection_to_cpu(self):
@@ -379,14 +361,12 @@ class RadianceView(mglw.WindowConfig):
         #     self._move_collection_to_cpu()
         with torch.no_grad():
             R, t, trans = self.get_rt()
+            q = Quaternion.from_matrix(R)
             # self.viewpoint_cam.set_rt(R, t)
             self.client.send_camera_pose(
-                position={"x": 0.1, "y": 0.0, "z": 1.5},
-                rotation={"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                position={k: str(v) for k, v in zip("xyz", t)},
+                rotation={k: str(v) for k, v in zip("xyzw", q)},
             )
-            # image = viewer_rendering.render_frame(
-            #     self.user_context, self.viewpoint_cam.timestamp, self.viewpoint_cam
-            # )
             image = self.client.receive()
             if "color" not in image:
                 image = {

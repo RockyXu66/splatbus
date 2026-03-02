@@ -47,13 +47,15 @@ def render_set(views, gaussians, pipeline, background):
         msg_port=6000,
     )
 
-    while True:
-        for view in views:
+    ipc_server.init_view(width, height, views[0][1])
+    running = True
+    while running:
+        try:
             # if not running:
             #     break
-            rendering = render(view[1].cuda(), gaussians, pipeline, background)[
-                "render"
-            ]
+            # ipc_server.update_view(view)
+            view: splatbus.IPCCamera = ipc_server.get_current_view().cuda()
+            rendering = render(view, gaussians, pipeline, background)["render"]
             # TODO: Accept channels=3. For now we'll padd alpha to 1:
             if rendering.shape[0] == 3:
                 alpha_channel = torch.ones_like(rendering[0:1, ...])
@@ -63,7 +65,11 @@ def render_set(views, gaussians, pipeline, background):
             ipc_server.update_frame(
                 color_data=rendering, depth_data=depth_data, inverse_depth=False
             )
-    ipc_server.close()
+        except KeyboardInterrupt:
+            running = False
+            ipc_server.close()
+        except:
+            ipc_server.close()
 
 
 def render_sets(
