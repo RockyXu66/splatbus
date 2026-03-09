@@ -44,7 +44,7 @@ class RadianceView(mglw.WindowConfig):
     gl_version = (3, 3)
     title = "RadianceViewer"
     # window_size = (1352, 1014)
-    window_size = (1600, 900)
+    window_size = (400, 400)
     aspect_ratio = None
     resizable = True
 
@@ -60,7 +60,10 @@ class RadianceView(mglw.WindowConfig):
             raise RuntimeError(
                 f"Failed to connect to Gaussian Splatting IPC Server: {e}"
             )
-        self.width, self.height = self.window_size
+        self.width, self.height = self.client.get_viewport_size()
+        self.window_size = (self.width, self.height)
+        # Resize the window to match the viewport size:
+
         self.time_range = (0, 10.0)  # self.user_context["time_range"]
         self.scene_bounds = 20  # self.user_context["scene_bounds"]
 

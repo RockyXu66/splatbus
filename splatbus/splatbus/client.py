@@ -4,7 +4,7 @@ import socket
 import struct
 import json
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from loguru import logger
 import torch
 
@@ -168,6 +168,26 @@ class GaussianSplattingIPCClient:
                 result['depth'] = self.client_buffer_depth.read_buffer
                 
         return result
+
+    def get_viewport_size(self) -> Tuple[int, int]:
+        """
+        Receive the viewport size from the server. This should be called after the
+        initial connection and buffer setup, ie to setup the client window size.
+        """
+        if self.client_buffer_evt is None:
+            logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
+        
+        payload = {
+            "type": "get_viewport_size"
+        }
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)  # Wait for response (can be empty)
+        except Exception:
+            json_msg = None
+        return json_msg.get("viewport_size", (0, 0)) if json_msg is not None else (0, 0)
+        
+        
 
     def send_camera_pose(self, position: Dict[str, float], rotation: Dict[str, float]):
         """

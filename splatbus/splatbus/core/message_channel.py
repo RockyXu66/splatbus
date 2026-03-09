@@ -127,6 +127,12 @@ class MessageSocketServer(BaseSocketServer):
             self._update_viewpoint_from_cam_pose()
         elif payload.get("type") == "point_cloud_pose":
             self._point_cloud_pose = payload
+        elif payload.get("type") == "get_viewport_size":
+            if self._viewpoint is not None:
+                w, h = self._viewpoint.image_width, self._viewpoint.image_height
+            else:
+                w, h = 0, 0
+            self.send_message({"viewport_size": (w, h)})
         else:
             logger.debug(
                 f"[MessageSocketServer] Unknown payload type: {payload.get('type')}"
