@@ -1,24 +1,18 @@
 import torch
 import ctypes
-from .cuda_buffer import CUDAFrameBuffer
-
+from .shared_buffer import SharedBuffer
+from .cuda_utils import IpcMem, IpcEvt, load_cuda_runtime
 from loguru import logger
 
-# IPC handle structures (64 bytes)
-class IpcMem(ctypes.Structure): 
-    _fields_ = [("raw", ctypes.c_byte * 64)]
-
-class IpcEvt(ctypes.Structure): 
-    _fields_ = [("raw", ctypes.c_byte * 64)]
-
 class IPCHandleManager:
+    """ Manage IPC handles """
 
-    def __init__(self, color_buffer: CUDAFrameBuffer, depth_buffer: CUDAFrameBuffer) -> None:
+    def __init__(self, color_buffer: SharedBuffer, depth_buffer: SharedBuffer) -> None:
 
-        self.color_buffer: CUDAFrameBuffer = color_buffer
-        self.depth_buffer: CUDAFrameBuffer = depth_buffer
+        self.color_buffer: SharedBuffer = color_buffer
+        self.depth_buffer: SharedBuffer = depth_buffer
 
-        self.cuda = self._load_cuda_runtime()
+        self.cuda = load_cuda_runtime()
 
         self.mem_handle_color = self._create_memory_handle(self.color_buffer)
         self.mem_handle_depth = self._create_memory_handle(self.depth_buffer)
@@ -34,7 +28,7 @@ class IPCHandleManager:
                 cuda = ctypes.CDLL("libcudart.so.11")
         return cuda
     
-    def _create_memory_handle(self, buffer: CUDAFrameBuffer) -> IpcMem:
+    def _create_memory_handle(self, buffer: SharedBuffer) -> IpcMem:
         """ Create memory handle """
         mh = IpcMem()
         ret = self.cuda.cudaIpcGetMemHandle(
@@ -98,10 +92,16 @@ class IPCHandleManager:
         return eh_frame, event_ptr
     
     def record_event(self):
-        """ Record event """
-
+        """ 
+        Record event to signal that the buffers are ready to read
+        Should be called after updating both color and depth buffers
+        """
+        # Synchronize to ensure all previous CUDA operations complete
+        # Using default stream (0) since SharedBuffer uses non_blocking=True which uses default stream
         torch.cuda.synchronize()
-        self.cuda.cudaEventRecord(self.evt_ptr, 0)  # Notify Unity that it can read
+        
+        # Record event on default stream to signal completion
+        self.cuda.cudaEventRecord(self.evt_ptr, ctypes.c_void_p(0))  # stream = 0 (default)
     
     def get_handle(self):
         """ Get all handles """
