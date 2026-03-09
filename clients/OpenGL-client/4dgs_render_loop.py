@@ -12,7 +12,6 @@
 import sys
 from argparse import ArgumentParser
 
-# from splatbus import GaussianSplattingIPCRenderer
 import splatbus
 import torch
 from arguments import ModelParams, OptimizationParams, PipelineParams
@@ -22,21 +21,8 @@ from omegaconf.dictconfig import DictConfig
 from scene import Scene
 from utils.general_utils import safe_state
 
-# running = True
-#
-#
-# def signal_handler(sig, frame):
-#     global running
-#     print("Exiting...")
-#     running = False
-#
-#
-# signal.signal(signal.SIGINT, signal_handler)
-
 
 def render_set(views, gaussians, pipeline, background):
-    global running
-    print(views[0][0].shape)
     width, height = views[0][0].shape[2], views[0][0].shape[1]
     ipc_server = splatbus.GaussianSplattingIPCRenderer(
         width,
@@ -51,9 +37,6 @@ def render_set(views, gaussians, pipeline, background):
     running = True
     while running:
         try:
-            # if not running:
-            #     break
-            # ipc_server.update_view(view)
             view: splatbus.IPCCamera = ipc_server.get_current_view().cuda()
             rendering = render(view, gaussians, pipeline, background)["render"]
             # TODO: Accept channels=3. For now we'll padd alpha to 1:
