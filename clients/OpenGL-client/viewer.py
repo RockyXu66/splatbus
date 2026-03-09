@@ -43,7 +43,6 @@ class HistData:
 class RadianceView(mglw.WindowConfig):
     gl_version = (3, 3)
     title = "RadianceViewer"
-    # window_size = (1352, 1014)
     window_size = (400, 400)
     aspect_ratio = None
     resizable = True
@@ -60,12 +59,10 @@ class RadianceView(mglw.WindowConfig):
             raise RuntimeError(
                 f"Failed to connect to Gaussian Splatting IPC Server: {e}"
             )
-        self.width, self.height = self.client.get_viewport_size()
-        self.window_size = (self.width, self.height)
-        # Resize the window to match the viewport size:
+        self.width, self.height = self.window_size
 
-        self.time_range = (0, 10.0)  # self.user_context["time_range"]
-        self.scene_bounds = 20  # self.user_context["scene_bounds"]
+        self.time_range = (0, 10.0)  # self.user_context["time_range"] # TODO: Get that from server
+        self.scene_bounds = 20  # self.user_context["scene_bounds"] # TODO: Get that from the server
 
         self.controller_choice = Controller.ORBIT
         self.panning_dir = 1
@@ -501,20 +498,20 @@ class RadianceView(mglw.WindowConfig):
         self.imgui.render(imgui.get_draw_data())
 
     def on_resize(self, width: int, height: int):
+        self.ctx.viewport = (0, 0, width, height)
         self.imgui.resize(width, height)
 
 
 if __name__ == "__main__":
     mglw.setup_basic_logging(20)  # INFO level
-    # window_cls = mglw.get_local_window_cls("glfw")  # or 'glfw', 'sdl2'
-    # window = window_cls(
-    #     title="Radiance View",
-    #     size=(1280, 720),
-    #     fullscreen=False,
-    #     resizable=True,
-    #     gl_version=(3, 3),
-    #     vsync=True,
-    # )
-    # window.config = RadianceView(sys.argv[1:], ctx=window.ctx, wnd=window)
-    # window.run()
+    client = GaussianSplattingIPCClient(
+        host="127.0.0.1", ipc_port=6001, msg_port=6000
+    )
+    client.connect()
+    width, height = client.get_viewport_size()
+    client.close()
+
+    RadianceView.window_size = (width, height)
+    RadianceView.resizable = False
+
     mglw.run_window_config(RadianceView)
