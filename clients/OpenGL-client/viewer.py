@@ -15,6 +15,8 @@ from splatbus import GaussianSplattingIPCClient
 
 console = Console()
 
+from cuda import cudart as cu
+
 
 def rotmat(a, b):
     a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
@@ -60,15 +62,20 @@ class RadianceView(mglw.WindowConfig):
                 f"Failed to connect to Gaussian Splatting IPC Server: {e}"
             )
         self.width, self.height = self.window_size
+        self.cuda_is_setup = False
 
-        self.time_range = (0, 10.0)  # self.user_context["time_range"] # TODO: Get that from server
-        self.scene_bounds = 20  # self.user_context["scene_bounds"] # TODO: Get that from the server
+        self.time_range = (
+            0,
+            10.0,
+        )  # self.user_context["time_range"] # TODO: Get that from server
+        self.scene_bounds = (
+            20  # self.user_context["scene_bounds"] # TODO: Get that from the server
+        )
 
         self.controller_choice = Controller.ORBIT
         self.panning_dir = 1
 
         # ======= Controls
-        # R, t = self.viewpoint_cam.R, self.viewpoint_cam.T
         R = np.eye(3, dtype=np.float32)
         t = np.zeros(3, dtype=np.float32)
         self.right = R[:, 0]
@@ -83,10 +90,7 @@ class RadianceView(mglw.WindowConfig):
         # Extract yaw/pitch from rotation matrix
         self.yaw = 0.0
         self.pitch = 0.0
-        # self.yaw = np.arctan2(R[1, 2], R[2, 2])
-        # self.pitch = np.arcsin(-R[2, 2])
         self.paused = False
-        # self.canonical_t = t
         self.speed = 0.1
         self.sensitivity = 0.005
         self.keys = set()
@@ -128,17 +132,17 @@ class RadianceView(mglw.WindowConfig):
             ],
             dtype="f4",
         )
+        self.prog = self.create_shader()
+        self.prog["tex"] = 0
         self.vbo = self.ctx.buffer(vertices.tobytes())
-        self.vao = self.ctx.simple_vertex_array(
-            self.create_shader(), self.vbo, "in_pos", "in_uv"
+        self.vao = self.ctx.simple_vertex_array(self.prog, self.vbo, "in_pos", "in_uv")
+        self.texture = self.ctx.texture(
+            (self.width, self.height),
+            components=4,
+            dtype="f1",
         )
-        # Texture
-        self.texture = self.ctx.texture((self.width, self.height), 3)
         self.texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        # PBO for async upload
-        print(f"Creating PBO with size: {self.width}x{self.height}x3")
-        self.pbo = self.ctx.buffer(reserve=self.width * self.height * 3)
-        self.pbo.orphan()  # hint that data will be frequently updated
+        self.setup_cuda()
         self._frames, self._export_n_frames = [], 500
         self._export_vid = False
 
@@ -174,6 +178,26 @@ class RadianceView(mglw.WindowConfig):
                 }
             """,
         )
+
+    def setup_cuda(self):
+        if self.cuda_is_setup:
+            return
+
+        GL_TEXTURE_2D = 0x0DE1
+        err, *_ = cu.cudaGLGetDevices(1, cu.cudaGLDeviceList.cudaGLDeviceListAll)
+        if err == cu.cudaError_t.cudaErrorUnknown:
+            raise RuntimeError("OpenGL context may be running on integrated graphics")
+
+        err, self.cuda_image = cu.cudaGraphicsGLRegisterImage(
+            self.texture.glo,
+            GL_TEXTURE_2D,
+            cu.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard,
+        )
+        if err != cu.cudaError_t.cudaSuccess:
+            raise RuntimeError("Unable to register opengl texture")
+
+        self.cuda_is_setup = True
+        print("CUDA setup complete, texture registered for CUDA access")
 
     # --- Mouse drag handler ---
     def on_mouse_position_event(self, x, y, dx, dy):
@@ -293,13 +317,9 @@ class RadianceView(mglw.WindowConfig):
 
     # --- Get R and t ---
     def get_rt(self):
-        # R = Matrix44.from_eulers([self.pitch, self.yaw, 0.0])[:3, :3]
         yaw_delta = self.yaw
         pitch_delta = self.pitch
 
-        # R_yaw = Matrix44.from_axis_rotation(Vector3(self.up), yaw_delta)
-        # R_pitch = Matrix44.from_axis_rotation(Vector3(self.right), pitch_delta)
-        # R_keyboard = R_yaw @ R_pitch
         q_yaw = Quaternion.from_axis_rotation(Vector3(self.up), yaw_delta)
         q_pitch = Quaternion.from_axis_rotation(-Vector3(self.right), pitch_delta)
 
@@ -310,7 +330,6 @@ class RadianceView(mglw.WindowConfig):
         R_keyboard = Matrix44.from_quaternion(q_total)[:3, :3]
         R = R_keyboard @ self.R_init
         t = self.position
-        # print(t, self.canonical_pose[:3, 3])
         trans = np.array([0.0, 0.0, 0.0])
         return R, t, trans
 
@@ -362,7 +381,6 @@ class RadianceView(mglw.WindowConfig):
         with torch.no_grad():
             R, t, trans = self.get_rt()
             q = Quaternion.from_matrix(R)
-            # self.viewpoint_cam.set_rt(R, t)
             self.client.send_camera_pose(
                 position={k: str(v) for k, v in zip("xyz", t)},
                 rotation={k: str(v) for k, v in zip("xyzw", q)},
@@ -370,20 +388,51 @@ class RadianceView(mglw.WindowConfig):
             image = self.client.receive()
             if "color" not in image:
                 image = {
-                    "color": torch.zeros(self.height, self.width, 4, dtype=torch.uint8)
+                    "color": torch.zeros(
+                        self.height, self.width, 4, dtype=torch.uint8, device="cuda"
+                    )
                 }
+            assert image["color"].is_cuda
 
         # Map PBO and write data
-        img = image["color"].cpu().numpy()
-        assert img.shape == (self.height, self.width, 4), (
-            f"Warning: Expected image shape ({self.height}, {self.width}, 4), got {img.shape}"
+        (err,) = cu.cudaGraphicsMapResources(1, self.cuda_image, cu.cudaStreamLegacy)
+        if err != cu.cudaError_t.cudaSuccess:
+            raise RuntimeError("Unable to map graphics resource")
+        err, array = cu.cudaGraphicsSubResourceGetMappedArray(self.cuda_image, 0, 0)
+        if err != cu.cudaError_t.cudaSuccess:
+            raise RuntimeError("Unable to get mapped array")
+
+        # Original image was float32 [0.0..1.0]. We scale it to 255 unsigned integer.
+        tensor = (image["color"] * 255.0).to(torch.uint8).contiguous()
+               
+        height = tensor.shape[0]
+        width = tensor.shape[1]
+        pitch = width * 4
+        width_bytes = width * 4
+        
+        torch_stream = torch.cuda.current_stream().cuda_stream
+        
+        (err,) = cu.cudaMemcpy2DToArrayAsync(
+            array,
+            0,
+            0,
+            tensor.data_ptr(),
+            pitch,
+            width_bytes,
+            height,
+            cu.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+            torch_stream,
         )
-        img = (img[:, :, :3] * 255.0).astype(np.uint8)  # Ensure uint8 format
-        self.pbo.write(img.tobytes())  # TODO: windowtensor thing
-        self.texture.write(self.pbo)
+        if err != cu.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"CUDA copy failed: {err}")
+        cu.cudaStreamSynchronize(torch_stream)
+
+        (err,) = cu.cudaGraphicsUnmapResources(1, self.cuda_image, cu.cudaStreamLegacy)
+        if err != cu.cudaError_t.cudaSuccess:
+            raise RuntimeError("Unable to unmap graphics resource")
 
         self.ctx.clear(0.0, 0.0, 0.0, 1.0)
-        self.texture.use()
+        self.texture.use(location=0)
         self.vao.render(moderngl.TRIANGLE_STRIP)
         # self.collection_stream.synchronize()
         # self._convert_collection_to_numpy()
@@ -504,12 +553,14 @@ class RadianceView(mglw.WindowConfig):
 
 if __name__ == "__main__":
     mglw.setup_basic_logging(20)  # INFO level
-    client = GaussianSplattingIPCClient(
-        host="127.0.0.1", ipc_port=6001, msg_port=6000
-    )
+    client = GaussianSplattingIPCClient(host="127.0.0.1", ipc_port=6001, msg_port=6000)
     client.connect()
     width, height = client.get_viewport_size()
     client.close()
+    if width == 0 or height == 0:
+        raise RuntimeError(
+            "Could not get width/height from Splatbus. Make sure the renderer is running!"
+        )
 
     RadianceView.window_size = (width, height)
     RadianceView.resizable = False
