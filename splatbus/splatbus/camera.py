@@ -207,7 +207,7 @@ class IPCCamera:
         cuda_copy = deepcopy(self)
         for k, v in cuda_copy.__dict__.items():
             if isinstance(v, torch.Tensor):
-                cuda_copy.__dict__[k] = v.to(cuda_copy.data_device)
+                cuda_copy.__dict__[k] = v.cuda()
         return cuda_copy
 
 

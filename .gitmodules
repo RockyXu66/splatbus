@@ -1,0 +1,3 @@
+[submodule "examples/4d-gaussian-splatting"]
+	path = examples/4d-gaussian-splatting
+	url = git@github.com:fudan-zvg/4d-gaussian-splatting.git

@@ -22,8 +22,14 @@ class SharedBuffer:
 
         self.ptr = self.buffer.data_ptr()
         self.pitch = width * channels * self.buffer.element_size()
-        
-        logger.info(f"[SharedBuffer] Created buffer: {width}x{height}x{channels}, pitch={self.pitch} bytes, ptr=0x{self.ptr:x}")
+
+        # Compute IPC offset: PyTorch's caching allocator may place this tensor
+        # at an offset within a larger cudaMalloc block. cudaIpcGetMemHandle returns
+        # the handle for the whole block, so the client needs this offset to read
+        # from the correct location.
+        self.ipc_offset = self.buffer.untyped_storage()._share_cuda_()[3]  # byte offset from cudaMalloc base
+
+        logger.info(f"[SharedBuffer] Created buffer: {width}x{height}x{channels}, pitch={self.pitch} bytes, ptr=0x{self.ptr:x}, ipc_offset={self.ipc_offset}")
     
     def update(self, image_data: torch.Tensor, inverse: bool = False):
         """
@@ -80,10 +86,10 @@ class SharedBuffer:
         else:
             raise ValueError(f"Invalid number of channels: {self.channels}")
         return {
-            'ptr': self.ptr,
             'width': self.width,
             'height': self.height,
             'pitch': self.pitch,
             'format': format,
+            'ipc_offset': self.ipc_offset,
         }
         

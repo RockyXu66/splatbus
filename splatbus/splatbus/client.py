@@ -132,20 +132,22 @@ class GaussianSplattingIPCClient:
         # Initialize Color Buffer with shared event
         if "mem_color" in payload:
             cb_color = ClientBuffer()
-            success = cb_color.open_mem_handle(payload["mem_color"], meta["w"], meta["h"], 4)
+            offset = meta.get("offsetColor", 0)
+            success = cb_color.open_mem_handle(payload["mem_color"], meta["w"], meta["h"], 4, offset=offset)
             if success:
                 cb_color.evt_ptr = evt_ptr  # Share the event
                 self.client_buffer_color = cb_color
-                logger.info("[IPCClient] Color buffer initialized with event sync")
+                logger.info(f"[IPCClient] Color buffer initialized with event sync (ipc_offset={offset})")
 
         # Initialize Depth Buffer with shared event
         if "mem_depth" in payload:
             cb_depth = ClientBuffer()
-            success = cb_depth.open_mem_handle(payload["mem_depth"], meta["w"], meta["h"], 1)
+            offset = meta.get("offsetDepth", 0)
+            success = cb_depth.open_mem_handle(payload["mem_depth"], meta["w"], meta["h"], 1, offset=offset)
             if success:
                 cb_depth.evt_ptr = evt_ptr  # Share the event
                 self.client_buffer_depth = cb_depth
-                logger.info("[IPCClient] Depth buffer initialized with event sync")
+                logger.info(f"[IPCClient] Depth buffer initialized with event sync (ipc_offset={offset})")
 
     def receive(self) -> Dict[str, torch.Tensor]:
         """
