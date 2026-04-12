@@ -22,6 +22,7 @@ class MessageSocketServer(BaseSocketServer):
         flip_z: bool = False,
     ) -> None:
         self._viewpoint: Optional[IPCCamera] = None
+        self._cam_list: Optional[List[IPCCamera]] = None
         self._cam_pose: Dict[str, Dict[str, float]] = {}
         self._point_cloud_pose = None
         self.gaussians_xyz_ori = None
@@ -94,6 +95,11 @@ class MessageSocketServer(BaseSocketServer):
             raise TypeError("view must be an instance of IPCCamera")
         self._viewpoint = view
 
+    def init_cam_list(self, cam_list: List[IPCCamera]):
+        if not all(isinstance(cam, IPCCamera) for cam in cam_list):
+            raise TypeError("cam_list must be a list of IPCCamera objects")
+        self._cam_list = cam_list
+
     @property
     def viewpoint(self) -> IPCCamera:
         if self._viewpoint is None:
@@ -139,6 +145,16 @@ class MessageSocketServer(BaseSocketServer):
             else:
                 w, h = 0, 0
             self.send_message({"viewport_size": (w, h)})
+        elif payload.get("type") == "get_camera_pose":
+            cam_idx = payload.get("cam_idx", 0)
+            if self._cam_list is not None:
+                cam: IPCCamera = self._cam_list[cam_idx%len(self._cam_list)]
+                t = cam.camera_center.cpu().numpy()
+                R = cam.R
+                quat = SciRot.from_matrix(R).as_quat()
+            else:
+                t, quat = np.zeros(3), np.zeros(4)
+            self.send_message({"position": t.tolist(), "rotation": quat.tolist()})
         else:
             logger.debug(
                 f"[MessageSocketServer] Unknown payload type: {payload.get('type')}"

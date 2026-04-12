@@ -5,6 +5,7 @@ import struct
 import json
 import threading
 from typing import Optional, Dict, Any, Tuple
+import numpy as np
 from loguru import logger
 import torch
 
@@ -188,6 +189,32 @@ class GaussianSplattingIPCClient:
         except Exception:
             json_msg = None
         return json_msg.get("viewport_size", (0, 0)) if json_msg is not None else (0, 0)
+
+    def get_camera_pose(self, cam_idx: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Receive the camera pose from the server.
+        """
+        if self.client_buffer_evt is None:
+            logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
+        
+        payload = {
+            "type": "get_camera_pose",
+            "cam_idx": cam_idx
+        }
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)  # Wait for response (can be empty)
+        except Exception:
+            json_msg = None
+        default_position = [0, 0, 0]
+        default_rotation = [0, 0, 0, 1]
+        if json_msg is not None:
+            position = json_msg.get("position", default_position)
+            rotation = json_msg.get("rotation", default_rotation)
+        else:
+            position = default_position
+            rotation = default_rotation
+        return np.array(position), np.array(rotation)
         
         
 

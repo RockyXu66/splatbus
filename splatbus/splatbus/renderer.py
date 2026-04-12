@@ -1,5 +1,6 @@
 """IPC renderer for Gaussian Splatting."""
 
+from typing import List
 import torch
 
 from splatbus.camera import IPCCamera
@@ -77,6 +78,9 @@ class GaussianSplattingIPCRenderer:
 
     def init_view(self, width: int, height: int, view: object):
         self.msg_server.init_view(IPCCamera.init_from_view(width, height, view))
+    
+    def set_cam_list(self, width: int, height: int, views: List[object]):
+        self.msg_server.init_cam_list([IPCCamera.init_from_view(width, height, view) for view in views])
 
     def get_current_view(self):
         return self.msg_server.viewpoint
