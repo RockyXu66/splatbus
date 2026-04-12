@@ -12,6 +12,7 @@ from moderngl_window.integrations.imgui_bundle import ModernglWindowRenderer
 from pyrr import Matrix44, Quaternion, Vector3
 from rich.console import Console
 from splatbus import GaussianSplattingIPCClient
+from scipy.spatial.transform import Rotation as SciRot
 
 console = Console()
 
@@ -72,22 +73,29 @@ class RadianceView(mglw.WindowConfig):
             20  # self.user_context["scene_bounds"] # TODO: Get that from the server
         )
 
-        self.controller_choice = Controller.ORBIT
+        # self.controller_choice = Controller.ORBIT
+        self.controller_choice = Controller.KEYBOARD_MOUSE
         self.panning_dir = 1
 
+        # The received camera pose is colmap coordinate system (+X right, +Y down, +Z forward)
+        t, quat = self.client.get_camera_pose(cam_idx=0)
+        colmap_c2w_rotmat = SciRot.from_quat(quat).as_matrix()
+        print(f"t: {t}, quat: {quat}, R: {colmap_c2w_rotmat}")
+        # Convert colmap coordinate system to OpenGL coordinate system (+X right, +Y up, -Z forward)
+        gl_c2w_rotmat = colmap_c2w_rotmat @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+
+
         # ======= Controls
-        R = np.eye(3, dtype=np.float32)
-        t = np.zeros(3, dtype=np.float32)
-        self.right = R[:, 0]
-        self.up = R[:, 1]
-        self.forward = R[:, 2]
-        self.R_init = R.copy()
+        self.right = gl_c2w_rotmat[:, 0]
+        self.up = gl_c2w_rotmat[:, 1]
+        self.forward = -gl_c2w_rotmat[:, 2]
+        self.R_init = gl_c2w_rotmat.copy()
         self.canonical_pose = np.eye(4, dtype=np.float32)
-        self.canonical_pose[:3, :3] = R
+        self.canonical_pose[:3, :3] = gl_c2w_rotmat
         self.canonical_pose[:3, 3] = t.squeeze()
         # Initialize position and orientation from given R, t
         self.position = Vector3(t.squeeze())
-        # Extract yaw/pitch from rotation matrix
+        # Initialize yaw and pitch to 0
         self.yaw = 0.0
         self.pitch = 0.0
         self.paused = False
@@ -208,6 +216,8 @@ class RadianceView(mglw.WindowConfig):
             self.controller_choice == Controller.KEYBOARD_MOUSE
             and not imgui.get_io().want_capture_mouse
         ):
+            # dx > 0 when the mouse is moving to the right
+            # dy > 0 when the mouse is moving down
             self.yaw += dx * self.sensitivity
             self.pitch += dy * self.sensitivity
         # self.pitch = np.clip(self.pitch, -np.pi / 2 + 1e-3, np.pi / 2 - 1e-3)
@@ -259,22 +269,14 @@ class RadianceView(mglw.WindowConfig):
             self.keys.discard(self.wnd.keys.NUMBER_0)
             print("Switched to ", self.controller_choice)
             self.position = Vector3(self.canonical_pose[:3, 3].squeeze())
-            # Extract yaw/pitch from rotation matrix
+            # Reset to initial yaw and pitch
             self.yaw = 0.0
             self.pitch = 0.0
         if self.controller_choice == Controller.KEYBOARD_MOUSE:
-            # # Local axes from yaw/pitch
-            forward = -np.array(
-                [
-                    np.cos(self.pitch) * np.sin(self.yaw),
-                    np.sin(self.pitch),
-                    np.cos(self.pitch) * np.cos(self.yaw),
-                ]
-            )
-            right = np.array(
-                [np.sin(self.yaw - np.pi / 2), 0.0, np.cos(self.yaw - np.pi / 2)]
-            )
-            up = np.cross(right, forward)
+            R = self.get_rotation_matrix()
+            forward = -R[:, 2]
+            right = R[:, 0]
+            up = R[:, 1]
 
             if self.wnd.keys.W in self.keys:
                 self.position += forward * self.speed
@@ -289,17 +291,22 @@ class RadianceView(mglw.WindowConfig):
             if self.wnd.keys.E in self.keys:
                 self.position -= up * self.speed
         elif self.controller_choice == Controller.ORBIT:
-            forward = -np.array(
+            # pitch=0, yaw=0, forward=(0, 0, -1)
+            forward_local = np.array(
                 [
                     np.cos(self.pitch) * np.sin(self.yaw),
                     np.sin(self.pitch),
-                    np.cos(self.pitch) * np.cos(self.yaw),
+                    -(np.cos(self.pitch) * np.cos(self.yaw)),
                 ]
             )
-            right = np.array(
-                [np.sin(self.yaw - np.pi / 2), 0.0, np.cos(self.yaw - np.pi / 2)]
+            # pitch=0, yaw=0, right=(1, 0, 0)
+            right_local = np.array(
+                [-np.sin(self.yaw - np.pi / 2), 0.0, np.cos(self.yaw - np.pi / 2)]
             )
-            up = np.cross(right, forward)
+            up_local = np.cross(right_local, forward_local)
+            forward = self.R_init @ forward_local
+            right = self.R_init @ right_local
+            up = self.R_init @ up_local
             strife = torch.norm(
                 (torch.from_numpy(self.position.xyz) - self.canonical_pose[:3, 3])
             ).item()
@@ -315,12 +322,14 @@ class RadianceView(mglw.WindowConfig):
             )
             self.yaw -= self.panning_dir * self.sensitivity
 
-    # --- Get R and t ---
-    def get_rt(self):
+    # Get camera rotation matrix in OpenGL coordinate system
+    def get_rotation_matrix(self):
         yaw_delta = self.yaw
         pitch_delta = self.pitch
 
-        q_yaw = Quaternion.from_axis_rotation(Vector3(self.up), yaw_delta)
+        # q_yaw > 0 (camera looks right) when yaw_delta > 0
+        q_yaw = Quaternion.from_axis_rotation(-Vector3(self.up), yaw_delta)
+        # q_pitch > 0 (camera looks down) when pitch_delta > 0
         q_pitch = Quaternion.from_axis_rotation(-Vector3(self.right), pitch_delta)
 
         # combine: yaw first, then pitch
@@ -329,9 +338,17 @@ class RadianceView(mglw.WindowConfig):
         # convert to rotation matrix
         R_keyboard = Matrix44.from_quaternion(q_total)[:3, :3]
         R = R_keyboard @ self.R_init
-        t = self.position
+        return np.asarray(R)
+
+    # --- Get R and t ---
+    def get_colmap_rt(self):
+        R = self.get_rotation_matrix()
+        t = self.position  # camera-to-world translation
         trans = np.array([0.0, 0.0, 0.0])
-        return R, t, trans
+
+        # Convert  OpenGL coordinate system to colmap coordinate system
+        colmap_R = R @ np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]])
+        return colmap_R, t, trans
 
     def _move_collection_to_cpu(self):
         def recurse(d):
@@ -379,7 +396,7 @@ class RadianceView(mglw.WindowConfig):
         #     self._collect_data_cuda()
         #     self._move_collection_to_cpu()
         with torch.no_grad():
-            R, t, trans = self.get_rt()
+            R, t, trans = self.get_colmap_rt()
             q = Quaternion.from_matrix(R)
             self.client.send_camera_pose(
                 position={k: str(v) for k, v in zip("xyz", t)},
@@ -389,7 +406,7 @@ class RadianceView(mglw.WindowConfig):
             if "color" not in image:
                 image = {
                     "color": torch.zeros(
-                        self.height, self.width, 4, dtype=torch.uint8, device="cuda"
+                        self.height, self.width, 4, dtype=torch.float32, device="cuda"
                     )
                 }
             assert image["color"].is_cuda

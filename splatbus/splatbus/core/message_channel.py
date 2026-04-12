@@ -1,11 +1,11 @@
 import socket
 import warnings
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import numpy as np
 import torch
 from loguru import logger
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as SciRot
 
 from splatbus.camera import IPCCamera
 
@@ -75,13 +75,19 @@ class MessageSocketServer(BaseSocketServer):
     def _update_viewpoint_from_cam_pose(self):
         cam_pose = self.cam_pose
         if cam_pose:
-            pos = cam_pose["position"]
-            rot = cam_pose["rotation"]
+            pos = cam_pose["position"]  # camera to world position
+            rot = cam_pose["rotation"]  # camera to world quaternion rotation
             t = np.array([[pos["x"], pos["y"], pos["z"]]], dtype=np.float32).reshape(3)
             R = quat_to_rot([float(x) for x in rot.values()])
             if self._viewpoint is None:
                 raise ValueError("Viewpoint is not initialized. Please call init_view() first.")
-            self._viewpoint.set_rt(R=R, t=t)
+            
+            # We need world to camera transform to update the viewpoint.
+            camera_to_world = np.eye(4)
+            camera_to_world[:3, :3] = R
+            camera_to_world[:3, 3] = t
+            world_to_camera = np.linalg.inv(camera_to_world)
+            self._viewpoint.set_rt(R=world_to_camera[:3, :3].T, t=world_to_camera[:3, 3])
 
     def init_view(self, view: IPCCamera):
         if not isinstance(view, IPCCamera):
@@ -105,7 +111,7 @@ class MessageSocketServer(BaseSocketServer):
             pos = point_cloud_pose["position"]
             rot = point_cloud_pose["rotation"]
 
-            unity_rot = R.from_quat([rot["x"], rot["y"], rot["z"], rot["w"]])
+            unity_rot = SciRot.from_quat([rot["x"], rot["y"], rot["z"], rot["w"]])
             unity_rot_mat = (
                 torch.from_numpy(unity_rot.as_matrix())
                 .float()
