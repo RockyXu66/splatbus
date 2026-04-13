@@ -5,17 +5,24 @@
 A Gaussian Splatting viewer framework via GPU interprocess communication for real-time rendering in external applications (e.g., Unity, Blender).
 
 ## Screenshots
-<div align="center">
-  <img src="assets/unity-screenshot-3dgs.png" alt="Unity 3DGS demo" width="70%"/>
-  <br/>
-  <em>Unity plugin visualizing real-time 3D Gaussian Splatting results with interactive point clouds and 3D meshes.</em>
-</div>
-<br/>
-<div align="center">
-  <img src="assets/unity-screenshot-mmlphuman.png" alt="Unity mmlphuman demo" width="70%"/>
-  <br/>
-  <em>Unity plugin visualizing real-time Gaussian avatar with 3D meshes.</em>
-</div>
+<table>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="assets/unity-3dgs.gif" alt="Unity 3DGS demo" width="85%"/><br/>
+      <em>Unity plugin visualizing real-time 3D Gaussian Splatting results with interactive point clouds and 3D meshes.</em>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img src="assets/unity-4dgs.gif" alt="Unity 4DGS demo" width="100%"/><br/>
+      <em>Unity plugin visualizing real-time 4D Gaussian Splatting scenes with dynamic content.</em>
+    </td>
+    <td align="center" width="50%">
+      <img src="assets/unity-mmlphuman.gif" alt="Unity mmlphuman demo" width="100%"/><br/>
+      <em>Unity plugin visualizing real-time Gaussian avatar with 3D meshes.</em>
+    </td>
+  </tr>
+</table>
 
 ## Overview
 
