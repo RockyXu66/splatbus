@@ -37,9 +37,11 @@ class IPCSocketServer(BaseSocketServer):
             "pitchColor": color_buffer_info['pitch'],
             "fmtDepth": depth_buffer_info['format'],
             "pitchDepth": depth_buffer_info['pitch'],
-            # Device pointers are needed to compute offsets from IPC base.
-            "ptrColor": int(color_buffer_info['ptr']),
-            "ptrDepth": int(depth_buffer_info['ptr']),
+            # Byte offsets from IPC handle base to actual tensor data.
+            # PyTorch's caching allocator may place tensors at an offset within
+            # a larger cudaMalloc block.
+            "offsetColor": int(color_buffer_info.get('ipc_offset', 0)),
+            "offsetDepth": int(depth_buffer_info.get('ipc_offset', 0)),
         }
         if device is not None:
             meta["device"] = int(device)

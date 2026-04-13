@@ -34,8 +34,8 @@ A Gaussian Splatting viewer framework via GPU interprocess communication for rea
 │  └──────────┬──────────────────┘    │     │    └───────────┬─────────────┘      │
 │             │                       │     │                │                    │
 │  ┌──────────▼──────────────────┐    │     │    ┌───────────▼─────────────┐      │
-│  │  CUDAFrameBuffer (Color)    │◄───┼─────┼────┤  CUDA IPC Memory Map    │      │
-│  │  CUDAFrameBuffer (Depth)    │    │ GPU │    │  (Zero-copy access)     │      │
+│  │  SharedBuffer (Color)       │◄───┼─────┼────┤  CUDA IPC Memory Map    │      │
+│  │  SharedBuffer (Depth)       │    │ GPU │    │  (Zero-copy access)     │      │
 │  └──────────┬──────────────────┘    │ MEM │    └───────────▲─────────────┘      │
 │             │                       │     │                │                    │
 │  ┌──────────▼──────────────────┐    │     │    ┌───────────┴─────────────┐      │
@@ -113,7 +113,7 @@ splatbus/
 # Terminal 1: Start the Python renderer (simulates Gaussian Splatting rendering)
 python splatbus/examples/server_test.py
 
-# Terminal 2: Start the simulated viewer
+# Terminal 2: Start the Python simulated viewer (save the images on the disk)
 python splatbus/examples/client_test.py
 ```
 

@@ -36,3 +36,17 @@ public struct PosePayload
     public Vector3Payload position;
     public QuaternionPayload rotation;
 }
+
+[Serializable]
+public struct Payload
+{
+    public string type;
+    public float timestamp;
+}
+
+[Serializable]
+public struct CameraPoseRequest
+{
+    public string type;
+    public int cam_idx;
+}
