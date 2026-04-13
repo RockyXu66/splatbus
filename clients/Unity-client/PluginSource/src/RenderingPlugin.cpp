@@ -407,6 +407,8 @@ static int    gW=0, gH=0;
 static cudaEvent_t gFrameDone = nullptr;
 static cudaStream_t gStream = 0;
 static void* gIpcBasePtr = nullptr; // Base pointer for shared IPC allocation
+static void* gIpcColorBase = nullptr; // Base from cudaIpcOpenMemHandle (non-shared)
+static void* gIpcDepthBase = nullptr; // Base from cudaIpcOpenMemHandle (non-shared)
 
 // For SetUnityTargets parameters
 static void* gPendingTexture = nullptr;
@@ -560,13 +562,14 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_ConnectToPython
             
             std::string fmtDepth = meta.at("fmtDepth").get<std::string>(); // Expected "R32F"
             gPitchDepth = meta.at("pitchDepth").get<size_t>();
-            uint64_t ptrColor = 0;
-            uint64_t ptrDepth = 0;
-            if (meta.contains("ptrColor")) {
-                ptrColor = meta.at("ptrColor").get<uint64_t>();
+
+            uint64_t offsetColor = 0;
+            uint64_t offsetDepth = 0;
+            if (meta.contains("offsetColor")) {
+                offsetColor = meta.at("offsetColor").get<uint64_t>();
             }
-            if (meta.contains("ptrDepth")) {
-                ptrDepth = meta.at("ptrDepth").get<uint64_t>();
+            if (meta.contains("offsetDepth")) {
+                offsetDepth = meta.at("offsetDepth").get<uint64_t>();
             }
 
             // Parse base64 handles
@@ -587,15 +590,17 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_ConnectToPython
                 cudaIpcCloseMemHandle(gIpcBasePtr);
                 gIpcBasePtr = nullptr;
             } else {
-                if (gIpcColorPtr) {
-                    cudaIpcCloseMemHandle(gIpcColorPtr);
+                if (gIpcColorBase) {
+                    cudaIpcCloseMemHandle(gIpcColorBase);
                 }
-                if (gIpcDepthPtr) {
-                    cudaIpcCloseMemHandle(gIpcDepthPtr);
+                if (gIpcDepthBase) {
+                    cudaIpcCloseMemHandle(gIpcDepthBase);
                 }
             }
             gIpcColorPtr = nullptr;
             gIpcDepthPtr = nullptr;
+            gIpcColorBase = nullptr;
+            gIpcDepthBase = nullptr;
 
             // Open IPC handles
             cudaIpcMemHandle_t mhc; std::memcpy(&mhc, mem_color.data(), sizeof(mhc));
@@ -616,13 +621,6 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_ConnectToPython
 
             const bool sharedHandle = (mem_color == mem_depth);
             if (sharedHandle) {
-                if (ptrColor == 0 || ptrDepth == 0) {
-                    ss.str("");
-                    ss << "RenderPlugin::GsIpc_ConnectToPythonServer() Error -> Shared IPC handle but missing ptrColor/ptrDepth" << std::endl;
-                    LogMessage(ss);
-                    socket_close(cli);
-                    continue;
-                }
                 cudaError_t e1 = cudaIpcOpenMemHandle(&gIpcBasePtr, mhc, cudaIpcMemLazyEnablePeerAccess);
                 if (e1 != cudaSuccess) 
                 { 
@@ -630,32 +628,40 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_ConnectToPython
                     ss << "RenderPlugin::GsIpc_ConnectToPythonServer() Error -> cudaIpcOpenMemHandle(shared): " << cudaGetErrorString(e1) << std::endl;
                     LogMessage(ss);
                     socket_close(cli);
-                    continue; // Wait for next client instead of shutting down
+                    continue;
                 }
-                const intptr_t depthOffset = (intptr_t)ptrDepth - (intptr_t)ptrColor;
-                gIpcColorPtr = gIpcBasePtr;
-                gIpcDepthPtr = (void*)((uintptr_t)gIpcBasePtr + (uintptr_t)depthOffset);
+                gIpcColorPtr = (void*)((uintptr_t)gIpcBasePtr + offsetColor);
+                gIpcDepthPtr = (void*)((uintptr_t)gIpcBasePtr + offsetDepth);
                 ss.str("");
-                ss << "RenderPlugin::GsIpc_ConnectToPythonServer() -> Shared IPC handle, depth offset: " << depthOffset << " bytes" << std::endl;
+                ss << "RenderPlugin::GsIpc_ConnectToPythonServer() -> Shared IPC handle, offsetColor: "
+                   << offsetColor << ", offsetDepth: " << offsetDepth << " bytes" << std::endl;
                 LogMessage(ss);
             } else {
-                cudaError_t e1 = cudaIpcOpenMemHandle(&gIpcColorPtr, mhc, cudaIpcMemLazyEnablePeerAccess);
+                cudaError_t e1 = cudaIpcOpenMemHandle(&gIpcColorBase, mhc, cudaIpcMemLazyEnablePeerAccess);
                 if (e1 != cudaSuccess) 
                 { 
                     ss.str("");
                     ss << "RenderPlugin::GsIpc_ConnectToPythonServer() Error -> cudaIpcOpenMemHandle(color): " << cudaGetErrorString(e1) << std::endl;
                     LogMessage(ss);
                     socket_close(cli);
-                    continue; // Wait for next client instead of shutting down
+                    continue;
                 }
-                cudaError_t e3 = cudaIpcOpenMemHandle(&gIpcDepthPtr, mhd, cudaIpcMemLazyEnablePeerAccess);
+                cudaError_t e3 = cudaIpcOpenMemHandle(&gIpcDepthBase, mhd, cudaIpcMemLazyEnablePeerAccess);
                 if (e3 != cudaSuccess) 
                 { 
                     ss.str("");
                     ss << "RenderPlugin::GsIpc_ConnectToPythonServer() Error -> cudaIpcOpenMemHandle(depth): " << cudaGetErrorString(e3) << std::endl;
                     LogMessage(ss);
                     socket_close(cli);
-                    continue; // Wait for next client instead of shutting down
+                    continue;
+                }
+                gIpcColorPtr = (void*)((uintptr_t)gIpcColorBase + offsetColor);
+                gIpcDepthPtr = (void*)((uintptr_t)gIpcDepthBase + offsetDepth);
+                if (offsetColor || offsetDepth) {
+                    ss.str("");
+                    ss << "RenderPlugin::GsIpc_ConnectToPythonServer() -> Separate handles, offsetColor: "
+                       << offsetColor << ", offsetDepth: " << offsetDepth << " bytes" << std::endl;
+                    LogMessage(ss);
                 }
             }
 
