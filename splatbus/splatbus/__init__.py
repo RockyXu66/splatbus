@@ -8,6 +8,7 @@ from .core.ipc_handles import IPCHandleManager
 from .renderer import GaussianSplattingIPCRenderer
 from .client import GaussianSplattingIPCClient
 # from .transform_server import TransformServer
+from .camera import IPCCamera
 
 __version__ = '0.1.0'
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     'GaussianSplattingIPCRenderer',
     'GaussianSplattingIPCClient',
     # 'TransformServer',
+    'IPCCamera',
 ]

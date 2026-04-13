@@ -25,14 +25,20 @@ class ClientBuffer:
             logger.error(f"[ClientBuffer] cudaStreamCreate failed with code {ret}")
             self.stream = None
         
-    def open_mem_handle(self, handle_b64: str, width: int, height: int, channels: int = 4) -> bool:
+    def open_mem_handle(self, handle_b64: str, width: int, height: int, channels: int = 4, offset: int = 0) -> bool:
         """
-        Open IPC handle from base64 string
+        Open IPC handle from base64 string.
+
+        Args:
+            offset: Byte offset from the IPC handle base to the actual tensor data.
+                    PyTorch's caching allocator may place tensors at an offset within
+                    a larger cudaMalloc block.
         """
         self.width = width
         self.height = height
         self.channels = channels
-        
+        self.ipc_offset = offset
+
         try:
             handle_bytes = base64.b64decode(handle_b64)
             mh = IpcMem()
@@ -55,7 +61,7 @@ class ClientBuffer:
             
             self.read_buffer = torch.empty((self.height, self.width, self.channels), dtype=torch.float32, device='cuda')
             
-            logger.info(f"[ClientBuffer] Opened handle, dev_ptr: {hex(dev_ptr.value)}")
+            logger.info(f"[ClientBuffer] Opened handle, dev_ptr: {hex(dev_ptr.value)}, ipc_offset: {offset}")
             logger.info(f"[ClientBuffer] Pre-allocated buffer (pytorch tensor): {self.read_buffer.shape}")
             return True
             
@@ -109,14 +115,15 @@ class ClientBuffer:
             if ret != 0:
                 logger.error(f"[ClientBuffer] cudaStreamWaitEvent failed with code {ret}")
         
-        # Async copy from IPC pointer to read_buffer
+        # Async copy from IPC pointer (+ offset) to read_buffer
         # cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind, cudaStream_t stream)
         size = self.width * self.height * self.channels * 4  # 4 bytes per float32
-        
+        src_ptr = ctypes.c_void_p(self.dev_ptr.value + self.ipc_offset)
+
         stream_handle = self.stream if self.stream else ctypes.c_void_p(0)
         ret = self.cuda.cudaMemcpyAsync(
             ctypes.c_void_p(self.read_buffer.data_ptr()),
-            self.dev_ptr,
+            src_ptr,
             ctypes.c_size_t(size),
             ctypes.c_int(3),        # cudaMemcpyDeviceToDevice = 3
             stream_handle

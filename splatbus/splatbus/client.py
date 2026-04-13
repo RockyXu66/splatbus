@@ -4,7 +4,8 @@ import socket
 import struct
 import json
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
+import numpy as np
 from loguru import logger
 import torch
 
@@ -43,25 +44,30 @@ class GaussianSplattingIPCClient:
             self.ipc_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.ipc_sock.connect((self.host, self.ipc_port))
             logger.info(f"[IPCClient] Connected to IPC {self.host}:{self.ipc_port}")
+        except Exception as e:
+            logger.error(f"[IPCClient] Connection to IPC failed: {e}")
+            self.close()
+            raise e
             
-            # Start IPC listener thread
-            self.ipc_thread = threading.Thread(
-                target=self._ipc_listener, 
-                daemon=True
-            )
-            self.ipc_thread.start()
+        # Start IPC listener thread
+        self.ipc_thread = threading.Thread(
+            target=self._ipc_listener, 
+            daemon=True
+        )
+        self.ipc_thread.start()
             
+        try:
             # Connect Message socket
             self.msg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.msg_sock.connect((self.host, self.msg_port))
             logger.info(f"[IPCClient] Connected to MSG {self.host}:{self.msg_port}")
             
             self.connected = True
-            
         except Exception as e:
-            logger.error(f"[IPCClient] Connection failed: {e}")
+            logger.error(f"[IPCClient] Connection to MSG failed: {e}")
             self.close()
             raise e
+            
 
     def _send_json(self, sock: socket.socket, payload: dict) -> None:
         if not sock:
@@ -127,20 +133,22 @@ class GaussianSplattingIPCClient:
         # Initialize Color Buffer with shared event
         if "mem_color" in payload:
             cb_color = ClientBuffer()
-            success = cb_color.open_mem_handle(payload["mem_color"], meta["w"], meta["h"], 4)
+            offset = meta.get("offsetColor", 0)
+            success = cb_color.open_mem_handle(payload["mem_color"], meta["w"], meta["h"], 4, offset=offset)
             if success:
                 cb_color.evt_ptr = evt_ptr  # Share the event
                 self.client_buffer_color = cb_color
-                logger.info("[IPCClient] Color buffer initialized with event sync")
+                logger.info(f"[IPCClient] Color buffer initialized with event sync (ipc_offset={offset})")
 
         # Initialize Depth Buffer with shared event
         if "mem_depth" in payload:
             cb_depth = ClientBuffer()
-            success = cb_depth.open_mem_handle(payload["mem_depth"], meta["w"], meta["h"], 1)
+            offset = meta.get("offsetDepth", 0)
+            success = cb_depth.open_mem_handle(payload["mem_depth"], meta["w"], meta["h"], 1, offset=offset)
             if success:
                 cb_depth.evt_ptr = evt_ptr  # Share the event
                 self.client_buffer_depth = cb_depth
-                logger.info("[IPCClient] Depth buffer initialized with event sync")
+                logger.info(f"[IPCClient] Depth buffer initialized with event sync (ipc_offset={offset})")
 
     def receive(self) -> Dict[str, torch.Tensor]:
         """
@@ -163,6 +171,52 @@ class GaussianSplattingIPCClient:
                 result['depth'] = self.client_buffer_depth.read_buffer
                 
         return result
+
+    def get_viewport_size(self) -> Tuple[int, int]:
+        """
+        Receive the viewport size from the server. This should be called after the
+        initial connection and buffer setup, ie to setup the client window size.
+        """
+        if self.client_buffer_evt is None:
+            logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
+        
+        payload = {
+            "type": "get_viewport_size"
+        }
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)  # Wait for response (can be empty)
+        except Exception:
+            json_msg = None
+        return json_msg.get("viewport_size", (0, 0)) if json_msg is not None else (0, 0)
+
+    def get_camera_pose(self, cam_idx: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Receive the camera pose from the server.
+        """
+        if self.client_buffer_evt is None:
+            logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
+        
+        payload = {
+            "type": "get_camera_pose",
+            "cam_idx": cam_idx
+        }
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)  # Wait for response (can be empty)
+        except Exception:
+            json_msg = None
+        default_position = [0, 0, 0]
+        default_rotation = [0, 0, 0, 1]
+        if json_msg is not None:
+            position = json_msg.get("position", default_position)
+            rotation = json_msg.get("rotation", default_rotation)
+        else:
+            position = default_position
+            rotation = default_rotation
+        return np.array(position), np.array(rotation)
+        
+        
 
     def send_camera_pose(self, position: Dict[str, float], rotation: Dict[str, float]):
         """

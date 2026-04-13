@@ -28,7 +28,7 @@ class BaseSocketServer(threading.Thread, ABC):
         self.sock.bind((self.host, self.port))
         self.sock.listen(1)
 
-        logger.info(f"\n[{self.server_name}] Listening on {self.host}:{self.port}...")
+        logger.info(f"[{self.server_name}] Listening on {self.host}:{self.port}...")
 
         self._running = True
         self._conn_ready = threading.Event()
@@ -61,7 +61,7 @@ class BaseSocketServer(threading.Thread, ABC):
     def send_json(self, data: dict):
         with self._conn_lock:
             if self._conn is None:
-                raise RuntimeError("[{self.server_name}] Client connection is not available.")
+                raise RuntimeError(f"[{self.server_name}] Client connection is not available.")
             conn = self._conn
         self._send_json(conn, data)
 
