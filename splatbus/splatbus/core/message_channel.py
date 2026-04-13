@@ -153,7 +153,8 @@ class MessageSocketServer(BaseSocketServer):
                 R = cam.R
                 quat = SciRot.from_matrix(R).as_quat()
             else:
-                t, quat = np.zeros(3), np.zeros(4)
+                t = np.array([0.0, 0.0, 0.0])
+                quat = np.array([0.0, 0.0, 0.0, 1.0])
             self.send_message({"position": t.tolist(), "rotation": quat.tolist()})
         else:
             logger.debug(
