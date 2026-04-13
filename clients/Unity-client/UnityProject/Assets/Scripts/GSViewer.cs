@@ -59,8 +59,9 @@ public class GSViewer : MonoBehaviour
 
     protected IEnumerator Initialize()
     {
-        Vector2Int resolution;
-        resolution = new Vector2Int((int)(cam.pixelWidth * texFactor), (int)(cam.pixelHeight * texFactor));
+        yield return new WaitForEndOfFrame(); // let the Game view size settle
+        ipcRenderWidth = Mathf.RoundToInt(cam.pixelWidth * texFactor);
+        ipcRenderHeight = Mathf.RoundToInt(cam.pixelHeight * texFactor);
 
         if (renderEventFunc == IntPtr.Zero)
         {
@@ -112,7 +113,7 @@ public class GSViewer : MonoBehaviour
 
     protected void Awake()
     {			
-        Debug.Log("UseRenderingPlugin::Awake()");
+        Debug.Log("GSViewer::Awake()");
         // Get a function pointer for our static log method for debugging
         Native.DebugLogDelegate logDelegate = new Native.DebugLogDelegate(NativeDebugLog);
         IntPtr logCallbackPtr = Marshal.GetFunctionPointerForDelegate(logDelegate);

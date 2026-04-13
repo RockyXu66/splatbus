@@ -23,13 +23,13 @@ public class UnityDataSender : MonoBehaviour
     public float sendInterval = 0.02f;
 
     private float elapsed;
-    private TcpJsonSender sender;
+    private SplatbusMessageClient client;
 
     private const string LogTag = "[UnityDataSender]";
 
     private void Awake()
     {
-        sender = new TcpJsonSender();
+        client = new SplatbusMessageClient();
     }
 
     private void Start()
@@ -44,11 +44,41 @@ public class UnityDataSender : MonoBehaviour
         }
 
         TryConnect();
+
+        if (client.IsConnected && targetCamera != null)
+        {
+            int cam_idx = 0;
+            GetCameraPose(targetCamera, cam_idx);
+            int[] size = GetViewportSize();
+            Debug.Log($"{LogTag} Viewpoint size: {size[0]}x{size[1]}");
+
+            int width = size[0];
+            int height = size[1];
+            if (width != targetCamera.pixelWidth || height != targetCamera.pixelHeight)
+            {
+                Debug.LogError(
+                    $"{LogTag} Viewport size mismatch. [Renderer: {width}x{height}] " +
+                    $" [Unity: {targetCamera.pixelWidth}x{targetCamera.pixelHeight}]" +
+                    $" -> Please adjust the viewport size in the renderer or the viewport size in Unity."
+                );
+                QuitWithError();
+                return;
+            }
+        }
+    }
+
+    private void QuitWithError()
+    {
+#if UNITY_EDITOR
+        UnityEditor.EditorApplication.isPlaying = false;
+#else
+        Application.Quit(1);
+#endif
     }
 
     private void Update()
     {
-        if (!sender.IsConnected)
+        if (!client.IsConnected)
         {
             if (autoReconnect)
             {
@@ -68,23 +98,23 @@ public class UnityDataSender : MonoBehaviour
 
     private void TryConnect()
     {
-        sender.Close();
+        client.Close();
 
         try
         {
-            sender.Connect(host, port);
+            client.Connect(host, port);
             Debug.Log($"{LogTag} Connected to {host}:{port}");
         }
         catch (Exception)
         {
             // Debug.LogWarning($"{LogTag} Failed to connect to {host}:{port} ({ex.Message})");
-            sender.Close();
+            client.Close();
         }
     }
 
     private void SendCameraPose()
     {
-        if (!sender.IsConnected)
+        if (!client.IsConnected)
         {
             return;
         }
@@ -103,7 +133,7 @@ public class UnityDataSender : MonoBehaviour
 
     private void SendPointCloudPose()
     {
-        if (!sender.IsConnected)
+        if (!client.IsConnected)
         {
             return;
         }
@@ -142,17 +172,121 @@ public class UnityDataSender : MonoBehaviour
 
         try
         {
-            sender.SendJson(payload);
+            client.SendJson(payload);
         }
         catch (Exception ex)
         {
             Debug.LogWarning($"{LogTag} Write {type} failed ({ex.Message})");
-            sender.Close();
+            client.Close();
         }
+    }
+
+    private int[] GetViewportSize()
+    {
+        int[] size = new int[2];
+        Payload payload = new Payload
+        {
+            type = "get_viewport_size",
+            timestamp = Time.realtimeSinceStartup
+        };
+
+        try
+        {
+            client.SendJson(payload);
+            string response = client.RecvJson();
+            Debug.Log($"{LogTag} Raw response: {response}");
+            size = ParseJsonIntArray(response, "viewport_size");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"{LogTag} Get viewpoint size failed ({ex.Message})");
+        }
+        return size;
+    }
+
+    private void GetCameraPose(Camera camera, int camIdx = 0)
+    {
+        CameraPoseRequest request = new CameraPoseRequest
+        {
+            type = "get_camera_pose",
+            cam_idx = camIdx
+        };
+
+        try
+        {
+            client.SendJson(request);
+            string response = client.RecvJson();
+            Debug.Log($"{LogTag} Raw response: {response}");
+
+            // Server returns: {"position": [x,y,z], "rotation": [x,y,z,w]}
+            // JsonUtility can't parse arrays into structs, so parse manually.
+            float[] posArr = ParseJsonFloatArray(response, "position");
+            float[] rotArr = ParseJsonFloatArray(response, "rotation");
+
+            Vector3 pos = new Vector3(posArr[0], posArr[1], posArr[2]);
+            Quaternion rot = new Quaternion(rotArr[0], rotArr[1], rotArr[2], rotArr[3]);
+
+            // Convert from OpenCV back to Unity coordinates if convertToOpenCV is enabled
+            if (convertToOpenCV)
+            {
+                pos = Utils.OpenCVToUnity(pos);
+                rot = Utils.OpenCVToUnity(rot);
+            }
+
+            camera.transform.position = pos;
+            camera.transform.rotation = rot;
+            Debug.Log($"{LogTag} Camera pose set: pos=({pos.x}, {pos.y}, {pos.z}), rot=({rot.x}, {rot.y}, {rot.z}, {rot.w})");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"{LogTag} Get camera pose failed ({ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// Extract a float array from a JSON string by key name.
+    /// Handles: "key": [1.0, 2.0, 3.0]
+    /// </summary>
+    private static float[] ParseJsonFloatArray(string json, string key)
+    {
+        string search = $"\"{key}\"";
+        int keyIdx = json.IndexOf(search);
+        if (keyIdx < 0) return Array.Empty<float>();
+
+        int bracketStart = json.IndexOf('[', keyIdx);
+        int bracketEnd = json.IndexOf(']', bracketStart);
+        string inner = json.Substring(bracketStart + 1, bracketEnd - bracketStart - 1);
+
+        string[] parts = inner.Split(',');
+        float[] result = new float[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            result[i] = float.Parse(parts[i].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+        }
+        return result;
+    }
+
+    private static int[] ParseJsonIntArray(string json, string key)
+    {
+        string search = $"\"{key}\"";
+        int keyIdx = json.IndexOf(search);
+        if (keyIdx < 0) return Array.Empty<int>();
+
+        int bracketStart = json.IndexOf('[', keyIdx);
+        int bracketEnd = json.IndexOf(']', bracketStart);
+        string inner = json.Substring(bracketStart + 1, bracketEnd - bracketStart - 1);
+
+        string[] parts = inner.Split(',');
+        int[] result = new int[parts.Length];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            result[i] = int.Parse(parts[i].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+        }
+        return result;
     }
 
     private void OnDestroy()
     {
-        sender.Close();
+        client.Close();
     }
 }
