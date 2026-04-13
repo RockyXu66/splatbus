@@ -82,9 +82,9 @@ See [**instructions**](https://github.com/RockyXu66/splatbus/tree/main/examples)
 
 ### Viewer (client)
 
-See [**instructions**](https://github.com/RockyXu66/splatbus/tree/main/clients/Unity-client) to run Unity viewer.
-
-Blender viewer and OpenGL viewer coming soon...
+- [**Unity viewer**](https://github.com/RockyXu66/splatbus/tree/main/clients/Unity-client)
+- [**OpenGL viewer**](https://github.com/RockyXu66/splatbus/tree/main/clients/OpenGL-client)
+- Blender viewer coming soon...
 
 ## Project Structure
 
@@ -93,16 +93,18 @@ splatbus/
 ├── splatbus/                   # Python package (renderer side)
 │   ├── splatbus/               # Core library
 │   │   ├── core/               
-│   │   └── renderer.py         # GaussianSplattingIPCRenderer
+│   │   ├── renderer.py         # GaussianSplattingIPCRenderer
+│   │   ├── client.py           # GaussianSplattingIPCClient
+│   │   └── camera.py           # IPCCamera interface
 │   └── examples/               # Python test scripts
 ├── clients/                    # Viewer implementations
 │   ├── Unity-client/           # Unity viewer plugin
-│   ├── Blender-client/         # Blender viewer addon
+│   ├── Blender-client/         # Blender viewer addon (coming soon)
 │   └── OpenGL-client/          # OpenGL viewer
-└── examples/                   # Integration examples (diff files)
-    ├── 3DGS.diff
-    ├── 4DGS.diff
-    └── GaussianAvatar.diff
+└── examples/                   # Integration examples
+    ├── 3dgs/                   # 3D Gaussian Splatting
+    ├── 4dgs/                   # 4D Gaussian Splatting
+    └── gaussian-avatar/        # GaussianAvatar (mmlphuman)
 ```
 
 ## Examples
@@ -129,11 +131,11 @@ python splatbus/examples/client_test.py \
 
 ### Integration Examples
 
-The `examples/` directory contains diff files demonstrating how to integrate SplatBus with various Gaussian Splatting implementations:
+The `examples/` directory contains standalone `splatbus_renderer.py` scripts for integrating SplatBus with various Gaussian Splatting implementations. See the [examples README](examples/README.md) for detailed usage instructions.
 
-- `3DGS.diff` - Integration with [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
-- `4DGS.diff` - Integration with [4D Gaussian Splatting](https://github.com/hustvl/4DGaussians)
-- `GaussianAvatar.diff` - Integration with [mmlphuman](https://github.com/1231234zhan/mmlphuman)
+- [`3dgs/splatbus_renderer.py`](examples/3dgs/splatbus_renderer.py) - Integration with [3D Gaussian Splatting](https://github.com/graphdeco-inria/gaussian-splatting)
+- [`4dgs/splatbus_renderer.py`](examples/4dgs/splatbus_renderer.py) - Integration with [4D Gaussian Splatting](https://github.com/hustvl/4DGaussians)
+- [`gaussian-avatar/splatbus_renderer.py`](examples/gaussian-avatar/splatbus_renderer.py) - Integration with [mmlphuman](https://github.com/1231234zhan/mmlphuman)
 
 ## API Reference
 

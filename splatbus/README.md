@@ -4,14 +4,40 @@ IPC (Inter-Process Communication) Package for Gaussian Splatting with CUDA suppo
 
 ## Overview
 
-`splatbus` provides a high-performance IPC mechanism for sharing CUDA frame buffers between Python and Unity (or other applications) for real-time Gaussian Splatting rendering.
+`splatbus` provides a high-performance IPC mechanism for sharing CUDA frame buffers between a Python renderer and clients (OpenGL, Unity, or other applications) for real-time Gaussian Splatting rendering.
 
 ## Features
 
 - **CUDA Frame Buffer Management**: GPU memory management for frame data
 - **IPC Handle Management**: Share CUDA memory across processes
 - **TCP Socket Communication**: Cross-platform inter-process communication
+- **Unified Camera Interface**: `IPCCamera` for consistent camera controls across clients
 - **Real-time Updates**: Optimized for low-latency frame updates
+
+## Project Structure
+
+```
+splatbus/
+├── splatbus/
+│   ├── __init__.py
+│   ├── renderer.py          # GaussianSplattingIPCRenderer
+│   ├── client.py            # GaussianSplattingIPCClient
+│   ├── camera.py            # IPCCamera interface
+│   └── core/
+│       ├── BaseSocket.py
+│       ├── shared_buffer.py
+│       ├── client_buffer.py
+│       ├── ipc_channel.py
+│       ├── ipc_handles.py
+│       ├── message_channel.py
+│       ├── cuda_utils.py
+│       └── utils.py
+├── examples/
+│   ├── server_test.py       # Simulated renderer
+│   └── client_test.py       # Simulated client
+├── pyproject.toml
+└── setup.py
+```
 
 ## Requirements
 
@@ -22,19 +48,19 @@ IPC (Inter-Process Communication) Package for Gaussian Splatting with CUDA suppo
 
 ## Examples
 
-### IPC test (Python renderer)
+### Simulated renderer (server)
 
-`examples/ipc_test.py` simulates the Python renderer loop and publishes CUDA buffers.
+`examples/server_test.py` simulates a Python renderer loop and publishes CUDA buffers via IPC:
 
 ```bash
-python examples/ipc_test.py
+python examples/server_test.py
 ```
 
 ### Simulated client
 
-`examples/client_test.py` connects to both channels to simulate client (e.g. Unity):
+`examples/client_test.py` connects to both channels to simulate a client (e.g. Unity, OpenGL viewer):
 
-- IPC channel (default `6001`): receives init packets
+- IPC channel (default `6001`): receives CUDA frame buffers
 - Message channel (default `6000`): sends camera and point cloud poses
 
 Run it with:
@@ -46,6 +72,6 @@ python examples/client_test.py
 Optional flags:
 
 ```bash
-python examples/client_test.py --host 127.0.0.1 --ipc-port 6001 --msg-port 6000 --interval 0.1
+python examples/client_test.py --host 127.0.0.1 --ipc-port 6001 --msg-port 6000 --interval 0.5
 ```
 
