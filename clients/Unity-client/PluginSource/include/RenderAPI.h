@@ -6,16 +6,11 @@
 
 struct IUnityInterfaces;
 
-#include <Eigen/Eigen>
-#include <Eigen/Dense>
 #include <cuda_runtime.h>
 #include <mutex>
 #include <memory>
-
-typedef Eigen::Matrix<float, 3, 1, Eigen::DontAlign> Vector3f;
-typedef Eigen::Matrix<float, 6, 1, Eigen::DontAlign> Vector6f;
-typedef	Eigen::Matrix<float, 4, 4, Eigen::DontAlign, 4, 4> Matrix4f;
-typedef	Eigen::Matrix<float, 3, 3, Eigen::DontAlign, 3, 3> Matrix3f;
+#include <string>
+#include <sstream>
 
 void LogMessage(const std::string& message);
 void LogMessage(const std::stringstream& ss);

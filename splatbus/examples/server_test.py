@@ -1,17 +1,25 @@
 """
 Basic usage example for splatbus package
 """
+import numpy as np
 import torch
-from splatbus import GaussianSplattingIPCRenderer
+import splatbus
 
 def main():
     # Initialize the renderer
-    print("Initializing renderer...")
-    renderer = GaussianSplattingIPCRenderer()
-
     width = 532
     height = 948
-    
+    print(f"Initializing renderer ({width}x{height})...")
+    renderer = splatbus.GaussianSplattingIPCRenderer(width=width, height=height)
+
+    default_view = splatbus.IPCCamera(
+        width=width, height=height,
+        R=np.eye(3, dtype=np.float32),
+        t=np.zeros(3, dtype=np.float32),
+        fov_x=1.0, fov_y=1.0,
+    )
+    renderer.msg_server.init_view(default_view)
+
     while True:
         # Generate or load your image data here
         image_data = torch.rand(4, height, width, device='cuda', dtype=torch.float32)

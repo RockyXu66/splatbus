@@ -74,8 +74,6 @@ find_package(CUDAToolkit REQUIRED)
 # find_package(Torch REQUIRED)
 
 include_directories(/usr/local/include)
-include_directories(/usr/include/eigen3)
-link_directories(/usr/local/lib)
 
 # Create shared library
 add_library(${PROJECT_NAME} SHARED ${SRCS})

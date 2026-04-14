@@ -69,8 +69,11 @@ A Gaussian Splatting viewer framework via GPU interprocess communication for rea
 
 - PyTorch >= 2.0.0 with CUDA support
 - CUDA-capable GPU (the same GPU must be accessible by both renderer and viewer processes)
-- Linux (CUDA IPC is supported on Linux only)
-- Windows (Under development; stay tuned.)
+- Linux or Windows
+
+### Windows Notes
+
+- The Unity viewer uses **D3D11** on Windows (instead of OpenGL on Linux). The native plugin handles this automatically via CUDA-D3D11 interop.
 
 ## Installation
 

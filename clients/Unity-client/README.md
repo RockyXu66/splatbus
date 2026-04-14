@@ -6,7 +6,7 @@ This project is adopted from Unity's official [NativeRenderingPlugin](https://gi
 
 ## Features
 
-- [x] **CUDA-OpenGL Interop**: GPU-to-GPU data transfer via CUDA IPC for high-performance rendering
+- [x] **CUDA-Graphics Interop**: GPU-to-GPU data transfer via CUDA IPC for high-performance rendering (OpenGL on Linux, D3D11 on Windows)
 - [x] **Depth-Aware Blending**: Properly blend Gaussian Splatting with Unity's 3D scene meshes
 - [x] **Real-time Camera Sync**: Stream camera poses from Unity to the renderer server via TCP
 - [x] **Interactive Point Clouds**: Manipulate point cloud objects for visualization control
@@ -22,14 +22,14 @@ This project is adopted from Unity's official [NativeRenderingPlugin](https://gi
 ### Build Dependencies
 
 - CMake >= 3.10
-- CUDA Toolkit (tested with CUDA 12.x)
-- OpenGL (GLVND)
-- C++14 compatible compiler
+- CUDA Toolkit (tested with CUDA 11.8 and 12.x)
+- C++14 compatible compiler (GCC on Linux, MSVC 2019+ on Windows)
+- OpenGL (GLVND) on Linux
 
 ### Runtime Dependencies
 
 - Unity 2023.1.15f1 or later
-- Linux (tested on Ubuntu)
+- Linux (tested on Ubuntu) or Windows (tested on Windows 11)
 - NVIDIA GPU with CUDA support
 
 ## Project Structure
@@ -45,8 +45,11 @@ This project is adopted from Unity's official [NativeRenderingPlugin](https://gi
 │   │   └── nlohmann/                # JSON library
 │   ├── dependencies/                # Third-party dependencies
 │   │   └── gl3w/                    # OpenGL loader
-│   └── projects/GNUMake/            # Build configuration
-│       └── CMakeLists.txt
+│   └── projects/
+│       ├── GNUMake/                 # Linux build configuration
+│       │   └── CMakeLists.txt
+│       └── CMakeWindows/            # Windows build configuration
+│           └── CMakeLists.txt
 │
 └── UnityProject/                    # Unity project
     └── Assets/
@@ -60,10 +63,14 @@ This project is adopted from Unity's official [NativeRenderingPlugin](https://gi
         │   ├── UnityViewerExample.unity  # SplatBus client scene
         │   └── scene.unity               # Original NativeRenderingPlugin demo
         └── Plugins/                 # Compiled native plugins
-            └── x86_64/libRenderingPlugin.so
+            └── x86_64/
+                ├── libRenderingPlugin.so   # Linux
+                └── RenderingPlugin.dll     # Windows
 ```
 
 ## Building the Native Plugin
+
+### Linux
 
 ```bash
 cd PluginSource/projects/GNUMake
@@ -79,6 +86,26 @@ make -j$(nproc)
 cp libRenderingPlugin.so ../../../../UnityProject/Assets/Plugins/x86_64/
 ```
 
+### Windows
+
+Requires Visual Studio with MSVC (tested with VS 2019; VS 2022 also works) and CUDA Toolkit.
+
+```bash
+cd PluginSource\projects\CMakeWindows
+
+# Create build directory
+mkdir build
+cd build
+
+# Configure and build (choose your Visual Studio version)
+cmake .. -G "Visual Studio 16 2019" -A x64
+:: Or for VS 2022: cmake .. -G "Visual Studio 17 2022" -A x64
+cmake --build . --config Release
+
+# Copy to Unity project
+copy Release\RenderingPlugin.dll ..\..\..\..\UnityProject\Assets\Plugins\x86_64\
+```
+
 ## Usage
 
 ### Setting Up the Unity Scene
@@ -87,23 +114,26 @@ cp libRenderingPlugin.so ../../../../UnityProject/Assets/Plugins/x86_64/
 2. Open `Assets/Scenes/UnityViewerExample.unity` (already pre-configured with all necessary components)
 
 **Optional**: If you need to customize the IPC settings, select the GSViewer component in main camera and adjust:
+
 - `IPC Render Width/Height`: Match your SplatBus renderer resolution
 
 ### Connecting to SplatBus Server
 
 1. Start the SplatBus renderer server (see [server_test.py](https://github.com/RockyXu66/splatbus/blob/main/splatbus/examples/server_test.py) for an example)
-   - IPC server: port `6001`
-   - Pose receiver: port `6000`
+  - IPC server: port `6001`
+  - Pose receiver: port `6000`
 2. Run the Unity scene
 3. The plugin will automatically connect and begin receiving rendered frames
 
 ### Component Overview
 
-| Component | Description |
-|-----------|-------------|
-| `GSViewer` | Main viewer component. Handles IPC frame receiving and depth-aware blending |
-| `UnityDataSender` | Sends camera/point cloud poses to the renderer server |
-| `UseRenderingPlugin` | Basic example showing texture/mesh buffer modification |
+
+| Component            | Description                                                                 |
+| -------------------- | --------------------------------------------------------------------------- |
+| `GSViewer`           | Main viewer component. Handles IPC frame receiving and depth-aware blending |
+| `UnityDataSender`    | Sends camera/point cloud poses to the renderer server                       |
+| `UseRenderingPlugin` | Basic example showing texture/mesh buffer modification                      |
+
 
 ### Network Configuration
 
@@ -115,8 +145,9 @@ cp libRenderingPlugin.so ../../../../UnityProject/Assets/Plugins/x86_64/
 ### Native Plugin
 
 - Added CUDA IPC module for receiving GPU memory handles from Python
-- Added GPU-to-GPU memory copy using CUDA-OpenGL interop
+- Added GPU-to-GPU memory copy using CUDA-OpenGL interop (Linux) and CUDA-D3D11 interop (Windows)
 - Added TCP socket communication for initialization handshake
+- Windows: D3D11 typed staging textures to work around Unity's typeless DXGI texture format
 
 ### Unity Project
 
@@ -133,3 +164,4 @@ See [LICENSE](LICENSE) file for details.
 - [Unity NativeRenderingPlugin](https://github.com/Unity-Technologies/NativeRenderingPlugin) - Base plugin framework
 - [GaussianSplattingVRViewerUnity](https://github.com/clarte53/GaussianSplattingVRViewerUnity) - Depth blending approach
 - [nlohmann/json](https://github.com/nlohmann/json) - JSON parsing library
+

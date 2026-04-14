@@ -18,16 +18,6 @@ class IPCHandleManager:
         self.mem_handle_depth = self._create_memory_handle(self.depth_buffer)
         self.evt_handle, self.evt_ptr = self._create_event_handle()
 
-    def _load_cuda_runtime(self):
-        try:
-            cuda = ctypes.CDLL("libcudart.so")  # Linux
-        except OSError:
-            try:
-                cuda = ctypes.CDLL("libcudart.so.12")
-            except OSError:
-                cuda = ctypes.CDLL("libcudart.so.11")
-        return cuda
-    
     def _create_memory_handle(self, buffer: SharedBuffer) -> IpcMem:
         """ Create memory handle """
         mh = IpcMem()
