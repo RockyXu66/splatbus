@@ -1,5 +1,6 @@
 import torch
 from loguru import logger
+from .cuda_utils import get_ipc_offset
 
 class SharedBuffer:
     """ Manage CUDA shared memory """
@@ -27,7 +28,7 @@ class SharedBuffer:
         # at an offset within a larger cudaMalloc block. cudaIpcGetMemHandle returns
         # the handle for the whole block, so the client needs this offset to read
         # from the correct location.
-        self.ipc_offset = self.buffer.untyped_storage()._share_cuda_()[3]  # byte offset from cudaMalloc base
+        self.ipc_offset = get_ipc_offset(self.buffer)
 
         logger.info(f"[SharedBuffer] Created buffer: {width}x{height}x{channels}, pitch={self.pitch} bytes, ptr=0x{self.ptr:x}, ipc_offset={self.ipc_offset}")
     
