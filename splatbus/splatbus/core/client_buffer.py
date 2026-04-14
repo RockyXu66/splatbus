@@ -156,7 +156,7 @@ class ClientBuffer:
             self.dev_ptr = None
             
         if self.evt_ptr:
-            self.cuda.cudaIpcCloseEventHandle(self.evt_ptr)
+            self.cuda.cudaEventDestroy(self.evt_ptr)
             self.evt_ptr = None
         
         # Clear read_buffer
