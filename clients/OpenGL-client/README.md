@@ -1,12 +1,39 @@
-# Usage
+# OpenGL Viewer Client
 
-## Render-side (i.e. 3DGS, 4DGS, etc.)
+A standalone OpenGL viewer that connects to a running SplatBus renderer (server) and displays the rendered Gaussian Splatting frames in real time via CUDA IPC.
 
-We provide an example render loop for 4DGS in `4dgs_render_loop.py`. You may adapt this
-to your needs, although it should mostly follow the same structure.
+## Requirements
 
-Simply implement this render loop into your 3DGS-based project and run it.
+- CUDA-capable GPU with OpenGL support (both must run on the same GPU)
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- A running SplatBus renderer (see [examples](../../examples))
 
-## Viewer-side
+## Installation
 
-`uv run viewer.py`
+```bash
+cd clients/OpenGL-client
+uv sync
+```
+
+This installs all Python dependencies (including `splatbus`) into a local virtual environment.
+
+## Usage
+
+First, start a SplatBus renderer (server), then launch the viewer:
+
+```bash
+uv run viewer.py
+```
+
+The viewer connects to `127.0.0.1` on IPC port `6001` and message port `6000` by default.
+
+## Controls
+
+| Key | Action |
+|-----|--------|
+| W / S | Move forward / backward |
+| A / D | Move left / right |
+| Q / E | Move up / down |
+| Mouse drag | Look around (yaw / pitch) |
+| Space | Pause / unpause |
+| 0 | Toggle between keyboard/mouse and orbit controller |
