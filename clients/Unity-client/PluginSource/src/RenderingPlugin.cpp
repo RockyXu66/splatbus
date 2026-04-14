@@ -7,6 +7,7 @@
 #include <math.h>
 #include <vector>
 
+#include <atomic>
 #include <thread>
 
 // TCP socket headers
