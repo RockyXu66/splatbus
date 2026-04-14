@@ -7,6 +7,7 @@
 #include <math.h>
 #include <vector>
 
+#include <atomic>
 #include <thread>
 
 // TCP socket headers
@@ -133,8 +134,11 @@ extern "C" void	UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginLoad(IUnit
 	OnGraphicsDeviceEvent(kUnityGfxDeviceEventInitialize);
 }
 
+static void GsIpc_CleanupTargets(); // forward declaration
+
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API UnityPluginUnload()
 {
+	GsIpc_CleanupTargets();
 	s_Graphics->UnregisterDeviceEventCallback(OnGraphicsDeviceEvent);
 }
 
@@ -386,10 +390,16 @@ extern "C" UNITY_INTERFACE_EXPORT unsigned int UNITY_INTERFACE_API GetBackBuffer
 // IPC functionality for Gaussian Splatting
 // --------------------------------------------------------------------------
 
-// For IPC functionality, we need OpenGL and CUDA interop
+// For IPC functionality, we need graphics-CUDA interop
 #if SUPPORT_OPENGL_UNIFIED
     #include "gl3w/gl3w.h"
     #include <cuda_gl_interop.h>
+#endif
+#if SUPPORT_D3D11
+    #include <d3d11.h>
+    #include <dxgi.h>
+    #include <cuda_d3d11_interop.h>
+    #include "Unity/IUnityGraphicsD3D11.h"
 #endif
 
 using json = nlohmann::json;
@@ -403,6 +413,16 @@ static size_t gPitchColor  = 0;
 static cudaGraphicsResource* gDepthRes = nullptr;
 static void*  gIpcDepthPtr = nullptr;
 static size_t gPitchDepth  = 0;
+
+#if SUPPORT_D3D11
+// Intermediate typed textures for CUDA-D3D11 interop (Unity creates typeless textures)
+static ID3D11Texture2D* gStagingColorTex = nullptr;
+static ID3D11Texture2D* gStagingDepthTex = nullptr;
+static ID3D11Texture2D* gUnityColorTex = nullptr;  // Unity's actual texture (for CopyResource)
+static ID3D11Texture2D* gUnityDepthTex = nullptr;
+static ID3D11Device* gD3DDevice = nullptr;
+static ID3D11DeviceContext* gD3DContext = nullptr;
+#endif
 static int    gW=0, gH=0;
 static cudaEvent_t gFrameDone = nullptr;
 static cudaStream_t gStream = 0;
@@ -439,12 +459,23 @@ static void socket_close(socket_t s) { ::close(s); }
 static int socket_error_code() { return errno; }
 #endif
 
+// --- Reliable recv (loops until all bytes received) ---
+static bool recv_exact(socket_t fd, char* buf, int size) {
+    int received = 0;
+    while (received < size) {
+        int r = ::recv(fd, buf + received, size - received, 0);
+        if (r <= 0) return false;
+        received += r;
+    }
+    return true;
+}
+
 // --- Length prefix reading ---
 static bool recv_packet(socket_t fd, std::vector<char>& out) {
-    uint32_t n=0;
-    if (::recv(fd, reinterpret_cast<char*>(&n), 4, MSG_WAITALL) != 4) return false;
+    uint32_t n = 0;
+    if (!recv_exact(fd, reinterpret_cast<char*>(&n), 4)) return false;
     out.resize(n);
-    return (::recv(fd, out.data(), n, MSG_WAITALL) == (int)n);
+    return recv_exact(fd, out.data(), (int)n);
 }
 
 // --- A simple base64 decoding implementation (RFC4648, no line breaks) ---
@@ -696,41 +727,156 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_PrepareUnityTar
     gNeedsTargetSetup = true;
 }
 
-// Function executed in rendering thread
-static void GsIpc_SetUnityTargets(void* glColorTexName, void* glDepthTexName, int w, int h)
+// Clean up CUDA and D3D11 resources from a previous GsIpc_SetUnityTargets call
+static void GsIpc_CleanupTargets()
 {
+    if (gColorRes) { cudaGraphicsUnregisterResource(gColorRes); gColorRes = nullptr; }
+    if (gDepthRes) { cudaGraphicsUnregisterResource(gDepthRes); gDepthRes = nullptr; }
+    if (gStream)   { cudaStreamDestroy(gStream); gStream = 0; }
+
+#if SUPPORT_D3D11
+    SAFE_RELEASE(gStagingColorTex);
+    SAFE_RELEASE(gStagingDepthTex);
+    // gUnityColorTex / gUnityDepthTex are owned by Unity — do not release
+    gUnityColorTex = nullptr;
+    gUnityDepthTex = nullptr;
+    SAFE_RELEASE(gD3DContext);
+    gD3DDevice = nullptr;  // owned by Unity, do not release
+#endif
+}
+
+// Function executed in rendering thread
+static void GsIpc_SetUnityTargets(void* colorTexPtr, void* depthTexPtr, int w, int h)
+{
+    // Clean up previous resources if re-registering
+    GsIpc_CleanupTargets();
     gW=w; gH=h;
-    GLuint tex = (GLuint)(uintptr_t)glColorTexName;
-	GLuint depthTex = (GLuint)(uintptr_t)glDepthTexName;
-    
+
     std::stringstream ss;
-    ss << "RenderPlugin::GsIpc_SetUnityTargets() -> tex: " << tex << "; w: " << w << "; h: " << h << std::endl;
+    ss << "RenderPlugin::GsIpc_SetUnityTargets() -> renderer: " << s_DeviceType
+       << "; w: " << w << "; h: " << h << std::endl;
     LogMessage(ss);
-    
-    // Register OpenGL color texture (RGBA32F)
-    cudaError_t err = cudaGraphicsGLRegisterImage(&gColorRes, tex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
-    if (err != cudaSuccess) {
+
+    cudaError_t err;
+
+#if SUPPORT_D3D11
+    if (s_DeviceType == kUnityGfxRendererD3D11)
+    {
+        // Get the D3D11 device from Unity
+        IUnityGraphicsD3D11* d3d11 = s_UnityInterfaces->Get<IUnityGraphicsD3D11>();
+        if (!d3d11) {
+            ss.str("");
+            ss << "RenderPlugin::GsIpc_SetUnityTargets() -> Failed to get IUnityGraphicsD3D11 interface" << std::endl;
+            LogMessage(ss);
+            return;
+        }
+        gD3DDevice = d3d11->GetDevice();
+        gD3DDevice->GetImmediateContext(&gD3DContext);
+
+        // Store Unity's textures (typeless) for CopyResource later
+        gUnityColorTex = (ID3D11Texture2D*)colorTexPtr;
+        gUnityDepthTex = (ID3D11Texture2D*)depthTexPtr;
+
+        // Create intermediate typed textures that CUDA can register
+        // (Unity creates typeless DXGI formats which CUDA cannot register directly)
+        D3D11_TEXTURE2D_DESC colorDesc = {};
+        colorDesc.Width = w;
+        colorDesc.Height = h;
+        colorDesc.MipLevels = 1;
+        colorDesc.ArraySize = 1;
+        colorDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        colorDesc.SampleDesc.Count = 1;
+        colorDesc.Usage = D3D11_USAGE_DEFAULT;
+        colorDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        HRESULT hr = gD3DDevice->CreateTexture2D(&colorDesc, nullptr, &gStagingColorTex);
+        if (FAILED(hr)) {
+            ss.str("");
+            ss << "RenderPlugin::GsIpc_SetUnityTargets() -> CreateTexture2D(color) failed: 0x" << std::hex << hr << std::dec << std::endl;
+            LogMessage(ss);
+            return;
+        }
+
+        D3D11_TEXTURE2D_DESC depthDesc = {};
+        depthDesc.Width = w;
+        depthDesc.Height = h;
+        depthDesc.MipLevels = 1;
+        depthDesc.ArraySize = 1;
+        depthDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        depthDesc.SampleDesc.Count = 1;
+        depthDesc.Usage = D3D11_USAGE_DEFAULT;
+        depthDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        hr = gD3DDevice->CreateTexture2D(&depthDesc, nullptr, &gStagingDepthTex);
+        if (FAILED(hr)) {
+            ss.str("");
+            ss << "RenderPlugin::GsIpc_SetUnityTargets() -> CreateTexture2D(depth) failed: 0x" << std::hex << hr << std::dec << std::endl;
+            LogMessage(ss);
+            gStagingColorTex->Release(); gStagingColorTex = nullptr;
+            return;
+        }
+
+        // Register the typed intermediate textures with CUDA
+        err = cudaGraphicsD3D11RegisterResource(&gColorRes, gStagingColorTex, cudaGraphicsRegisterFlagsNone);
+        if (err != cudaSuccess) {
+            ss.str("");
+            ss << "RenderPlugin::GsIpc_SetUnityTargets() -> cudaGraphicsD3D11RegisterResource(color) failed: " << cudaGetErrorString(err) << std::endl;
+            LogMessage(ss);
+            return;
+        }
+        err = cudaGraphicsD3D11RegisterResource(&gDepthRes, gStagingDepthTex, cudaGraphicsRegisterFlagsNone);
+        if (err != cudaSuccess) {
+            ss.str("");
+            ss << "RenderPlugin::GsIpc_SetUnityTargets() -> cudaGraphicsD3D11RegisterResource(depth) failed: " << cudaGetErrorString(err) << std::endl;
+            LogMessage(ss);
+            return;
+        }
+
+        cudaStreamCreate(&gStream);
         ss.str("");
-        ss << "RenderPlugin::GsIpc_SetUnityTargets() -> cudaGraphicsGLRegisterImage failed: " << cudaGetErrorString(err) << std::endl;
+        ss << "RenderPlugin::GsIpc_SetUnityTargets() -> D3D11 typed staging textures created and registered with CUDA" << std::endl;
         LogMessage(ss);
         return;
     }
-    // Register OpenGL depth texture (R32F)
-    err = cudaGraphicsGLRegisterImage(&gDepthRes, depthTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
-    if (err != cudaSuccess) {
+#endif
+
+#if SUPPORT_OPENGL_UNIFIED
+    if (s_DeviceType == kUnityGfxRendererOpenGLCore || s_DeviceType == kUnityGfxRendererOpenGLES30)
+    {
+        GLuint tex = (GLuint)(uintptr_t)colorTexPtr;
+        GLuint depthTex = (GLuint)(uintptr_t)depthTexPtr;
+
+        // Register OpenGL color texture (RGBA32F)
+        err = cudaGraphicsGLRegisterImage(&gColorRes, tex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+        if (err != cudaSuccess) {
+            ss.str("");
+            ss << "RenderPlugin::GsIpc_SetUnityTargets() -> cudaGraphicsGLRegisterImage(color) failed: " << cudaGetErrorString(err) << std::endl;
+            LogMessage(ss);
+            return;
+        }
+        // Register OpenGL depth texture (R32F)
+        err = cudaGraphicsGLRegisterImage(&gDepthRes, depthTex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+        if (err != cudaSuccess) {
+            ss.str("");
+            ss << "RenderPlugin::GsIpc_SetUnityTargets() -> cudaGraphicsGLRegisterImage(depth) failed: " << cudaGetErrorString(err) << std::endl;
+            LogMessage(ss);
+            return;
+        }
+
+        cudaStreamCreate(&gStream);
         ss.str("");
-        ss << "RenderPlugin::GsIpc_SetUnityTargets() -> cudaGraphicsGLRegisterImage failed: " << cudaGetErrorString(err) << std::endl;
+        ss << "RenderPlugin::GsIpc_SetUnityTargets() -> OpenGL textures registered with CUDA" << std::endl;
         LogMessage(ss);
         return;
     }
-    cudaStreamCreate(&gStream);
-    
+#endif
+
     ss.str("");
-    ss << "RenderPlugin::GsIpc_SetUnityTargets() -> Successfully registered texture" << std::endl;
+    ss << "RenderPlugin::GsIpc_SetUnityTargets() -> Unsupported renderer type: " << s_DeviceType << std::endl;
     LogMessage(ss);
 }
 
-extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_UpdateFrame() 
+extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_UpdateFrame()
 {
     std::stringstream ss;
     // ss.str("");
@@ -782,6 +928,17 @@ extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API GsIpc_UpdateFrame()
 
     cudaGraphicsUnmapResources(1, &gColorRes, gStream);
     cudaGraphicsUnmapResources(1, &gDepthRes, gStream);
+
+#if SUPPORT_D3D11
+    // D3D11: sync CUDA, then copy staging textures to Unity's typeless textures
+    if (s_DeviceType == kUnityGfxRendererD3D11 && gD3DContext) {
+        cudaStreamSynchronize(gStream);
+        if (gStagingColorTex && gUnityColorTex)
+            gD3DContext->CopyResource(gUnityColorTex, gStagingColorTex);
+        if (gStagingDepthTex && gUnityDepthTex)
+            gD3DContext->CopyResource(gUnityDepthTex, gStagingDepthTex);
+    }
+#endif
 }
 
 static void UNITY_INTERFACE_API OnRenderEvent(int eventID)

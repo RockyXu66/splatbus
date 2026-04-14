@@ -395,6 +395,12 @@ class RadianceView(mglw.WindowConfig):
         # with torch.cuda.stream(self.collection_stream):
         #     self._collect_data_cuda()
         #     self._move_collection_to_cpu()
+
+        # Wait for IPC buffers to be initialized before rendering
+        if self.client.client_buffer_color is None:
+            self.ctx.clear(0.0, 0.0, 0.0, 1.0)
+            return
+
         with torch.no_grad():
             R, t, trans = self.get_colmap_rt()
             q = Quaternion.from_matrix(R)
