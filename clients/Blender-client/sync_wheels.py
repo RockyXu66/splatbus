@@ -91,16 +91,53 @@ def is_package_downloaded(pkg_spec: str) -> bool:
     return False
 
 
+def _lock_is_current() -> bool:
+    uv_lock = SPLATBUS_SRC / "uv.lock"
+    pyproject = SPLATBUS_SRC / "pyproject.toml"
+    if not uv_lock.exists():
+        return False
+    if pyproject.exists() and uv_lock.stat().st_mtime < pyproject.stat().st_mtime:
+        return False
+    return True
+
+
+def _everything_downloaded() -> bool:
+    existing = list(WHEELS.glob("*.whl"))
+    if not existing:
+        return False
+    prefixes = {"loguru", "numpy", "scipy", "splatbus"}
+    for prefix in prefixes:
+        if not any(w.name.lower().startswith(prefix) for w in existing):
+            return False
+
+    # Check splatbus wheel isn't stale vs source
+    wheel = next(w for w in existing if w.name.lower().startswith("splatbus"))
+    src_mtime = max(
+        p.stat().st_mtime for p in SPLATBUS_SRC.rglob("*.py")
+        if p.is_file() and ".venv" not in p.parts and "__pycache__" not in p.parts
+    ) if SPLATBUS_SRC.exists() else 0
+    if wheel.stat().st_mtime < src_mtime:
+        return False
+
+    return True
+
+
 def main():
     WHEELS.mkdir(parents=True, exist_ok=True)
 
-    print("Locking splatbus dependencies …")
-    subprocess.run(
-        ["uv", "lock"],
-        cwd=SPLATBUS_SRC,
-        check=True,
-        capture_output=True,
-    )
+    # Fast path: skip everything if lock is current and all wheels exist
+    if _lock_is_current() and _everything_downloaded():
+        print("All wheels are already up-to-date, nothing to do.")
+        return
+
+    if not _lock_is_current():
+        print("Locking splatbus dependencies …")
+        subprocess.run(
+            ["uv", "lock"],
+            cwd=SPLATBUS_SRC,
+            check=True,
+            capture_output=True,
+        )
 
     reqs_file = HERE / "splatbus-requirements.txt"
     print(f"Exporting requirements to {reqs_file} …")
@@ -151,7 +188,7 @@ def main():
                 plat_entries[plat_name].append(pkg_spec)
 
 
-    # Download pure-Python wheels once (use the first platform’s tag)
+    # Download pure-Python wheels once (use the first platform's tag)
     missing_pure = [pkg for pkg in pure_entries if not is_package_downloaded(pkg)]
     first_plat = next(iter(PLATFORMS.values()))
     if missing_pure:
@@ -170,7 +207,7 @@ def main():
         print(f"Downloading {len(missing_plat)} packages for {plat_name} …")
         _pip_download(missing_plat, plat_cfg["pip_platforms"], label=plat_name)
 
-    # Build and copy splatbus wheel
+    # Build and copy splatbus wheel (skipped if _everything_downloaded already covered it)
     print("Building splatbus wheel …")
     subprocess.run(["uv", "build", "--directory", SPLATBUS_SRC], check=True)
     for whl in (SPLATBUS_SRC / "dist").glob("splatbus-*.whl"):
