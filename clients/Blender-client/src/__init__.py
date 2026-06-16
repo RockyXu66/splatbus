@@ -233,7 +233,6 @@ def _receive_frame() -> Optional[np.ndarray]:
     if _state.client is None or not _state.client.connected:
         return None
     result = _state.client.receive()
-    print("TICK frame: ", result)
     if not result or "color" not in result:
         return None
     tensor = result["color"]
@@ -308,12 +307,17 @@ def _draw_viewport():
     shader = gpu.shader.from_builtin("IMAGE")
     shader.bind()
     shader.uniform_sampler("image", tex)
-    shader.uniform_vector_float("color", (1.0, 1.0, 1.0, 1.0), 4)
 
     gpu.state.blend_set("ALPHA")
-    with gpu.matrix.push_pop():
+    with gpu.matrix.push_pop_projection():
+        proj = Matrix((
+            (2 / w, 0, 0, -1),
+            (0, 2 / h, 0, -1),
+            (0, 0, -1, 0),
+            (0, 0, 0, 1),
+        ))
+        gpu.matrix.load_projection_matrix(proj)
         gpu.matrix.load_identity()
-        gpu.matrix.orthographic_2d(0, w, 0, h)
         batch = batch_for_shader(
             shader, "TRI_FAN",
             {
