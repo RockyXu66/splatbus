@@ -27,20 +27,13 @@ from mathutils import Matrix, Vector
 try:
     import torch
 except ImportError:
-    from unittest.mock import MagicMock
-    mock_torch = MagicMock()
-    mock_torch.device = MagicMock()
-    mock_torch.Tensor = MagicMock()
-    sys.modules['torch'] = mock_torch
-
-from splatbus import GaussianSplattingIPCClient
-from scipy.spatial.transform import Rotation as SciRot
+    torch = None  # will be caught at connect time
 
 
 # ===================== STATE =====================
 
 class _SplatbusState:
-    client: Optional[GaussianSplattingIPCClient] = None
+    client: Optional[object] = None
     width: int = 0
     height: int = 0
 
@@ -203,7 +196,9 @@ def _send_pose():
     RT4 = np.concatenate([np.column_stack([R, t]), bottom], axis=0)
     c2w = np.linalg.inv(RT4)
     position = c2w[:3, 3]
-    q_xyzw = SciRot.from_matrix(c2w[:3, :3]).as_quat()
+    rot = Matrix(c2w[:3, :3].tolist())
+    q = rot.to_quaternion()
+    q_xyzw = np.array([q.x, q.y, q.z, q.w])
 
     _state.client.send_camera_pose(
         position={k: str(v) for k, v in zip("xyz", position)},
@@ -216,6 +211,7 @@ def _receive_frame() -> Optional[np.ndarray]:
     if _state.client is None or not _state.client.connected:
         return None
     result = _state.client.receive()
+    print("TICK frame: ", result)
     if not result or "color" not in result:
         return None
     tensor = result["color"]
@@ -244,17 +240,16 @@ def _update_compositor_image(color_np: np.ndarray):
         return
     h, w = color_np.shape[:2]
     img = bpy.data.images.get("SplatbusOutput")
-    if img is None:
+    if img is None or img.size[0] != w or img.size[1] != h:
+        if img is not None:
+            bpy.data.images.remove(img)
         img = bpy.data.images.new("SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True)
-    if img.size[0] != w or img.size[1] != h:
-        img.scale(w, h)
     flat = np.empty(w * h * 4, dtype=np.float32)
     flat[0::4] = color_np[..., 0].ravel()
     flat[1::4] = color_np[..., 1].ravel()
     flat[2::4] = color_np[..., 2].ravel()
-    single_alpha = color_np[..., 3:4].ravel() if color_np.shape[2] == 4 else np.ones(w * h, dtype=np.float32)
-    flat[3::4] = single_alpha
-    img.pixels = flat.tolist()
+    flat[3::4] = 1.0
+    img.pixels.foreach_set(flat)
 
 
 # ===================== TICK =====================
@@ -291,18 +286,23 @@ def _draw_viewport():
         return
     w, h = region.width, region.height
 
-    gpu.state.blend_set("ALPHA")
     shader = gpu.shader.from_builtin("2D_IMAGE")
     shader.bind()
     shader.uniform_sampler("image", tex)
-    batch = batch_for_shader(
-        shader, "TRI_FAN",
-        {
-            "pos": ((0, 0), (w, 0), (w, h), (0, h)),
-            "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1)),
-        },
-    )
-    batch.draw(shader)
+    shader.uniform_vector_float("color", (1.0, 1.0, 1.0, 1.0), 4)
+
+    gpu.state.blend_set("ALPHA")
+    with gpu.matrix.push_pop():
+        gpu.matrix.load_identity()
+        gpu.matrix.orthographic_2d(0, w, 0, h)
+        batch = batch_for_shader(
+            shader, "TRI_FAN",
+            {
+                "pos": ((0, 0), (w, 0), (w, h), (0, h)),
+                "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1)),
+            },
+        )
+        batch.draw(shader)
     gpu.state.blend_set("NONE")
 
 
@@ -415,6 +415,22 @@ class SplatbusConnectOperator(bpy.types.Operator):
     def execute(self, context):
         if _state.is_running:
             self.report({"INFO"}, "Already connected")
+            return {"CANCELLED"}
+
+        if torch is None:
+            self.report(
+                {"ERROR"},
+                "PyTorch is not available. SplatBus requires PyTorch with CUDA support.",
+            )
+            return {"CANCELLED"}
+
+        try:
+            from splatbus import GaussianSplattingIPCClient
+        except ImportError as e:
+            self.report(
+                {"ERROR"},
+                f"Cannot import splatbus: {e}. Make sure PyTorch is installed.",
+            )
             return {"CANCELLED"}
 
         props = context.scene.splatbus_setup

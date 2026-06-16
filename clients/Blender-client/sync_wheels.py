@@ -105,7 +105,7 @@ def _everything_downloaded() -> bool:
     existing = list(WHEELS.glob("*.whl"))
     if not existing:
         return False
-    prefixes = {"loguru", "numpy", "scipy", "splatbus"}
+    prefixes = {"loguru", "numpy", "splatbus"}
     for prefix in prefixes:
         if not any(w.name.lower().startswith(prefix) for w in existing):
             return False

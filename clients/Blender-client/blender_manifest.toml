@@ -41,8 +41,6 @@ platforms = ["windows-x64", "macos-arm64", "linux-x64"]
 # # Other supported platforms: "windows-arm64", "macos-x64"
 
 dependencies = [
-  # "numpy",
-  # "scipy",
   "torch>=2.0.0",
   "loguru>=0.7.0",
 ]
