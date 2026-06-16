@@ -1,35 +1,29 @@
 bl_info = {
     "name": "Splatbus",
     "author": "Théo Morales, Yinghan Xu",
-    "version": (0, 4, 2),
+    "version": (0, 0, 1),
     "blender": (4, 2, 0),
     "category": "Scene",
     "description": "Gaussian Splating unified rendering interface",
 }
 
-import math
-import os
-import pickle
-import shutil
-from pathlib import Path
-from typing import List
+import sys
+import traceback
+from typing import Optional
 
 import bpy
+import gpu
 import numpy as np
 from bpy.props import (
     BoolProperty,
-    EnumProperty,
-    FloatProperty,
-    FloatVectorProperty,
     IntProperty,
-    IntVectorProperty,
     StringProperty,
+    PointerProperty,
 )
-from mathutils import Euler, Matrix, Vector
+from gpu.types import GPUTexture
+from gpu_extras.batch import batch_for_shader
+from mathutils import Matrix, Vector
 
-# Mock torch dynamically if it's not installed in Blender's Python environment,
-# since the Blender client only uses camera/socket communication and doesn't need PyTorch.
-import sys
 try:
     import torch
 except ImportError:
@@ -42,7 +36,26 @@ except ImportError:
 from splatbus import GaussianSplattingIPCClient
 from scipy.spatial.transform import Rotation as SciRot
 
-# ---------------------PROPERTY DEFINITIONS
+
+# ===================== STATE =====================
+
+class _SplatbusState:
+    client: Optional[GaussianSplattingIPCClient] = None
+    width: int = 0
+    height: int = 0
+
+    color_buffer_np: Optional[np.ndarray] = None
+    gpu_texture: Optional[GPUTexture] = None
+
+    draw_handler: Optional[object] = None
+    timer: Optional[object] = None
+    is_running: bool = False
+    compositor_ready: bool = False
+
+_state = _SplatbusState()
+
+
+# ===================== PROPERTIES =====================
 
 
 class SplatbusProperties(bpy.types.PropertyGroup):
@@ -51,22 +64,31 @@ class SplatbusProperties(bpy.types.PropertyGroup):
         description="Whether to render content received from SplatBus.",
         default=True,
     )
+    host: StringProperty(
+        name="Server host",
+        default="127.0.0.1",
+    )
+    ipc_port: IntProperty(
+        name="IPC port",
+        default=6001,
+        min=1024, max=65535,
+    )
+    msg_port: IntProperty(
+        name="Message port",
+        default=6000,
+        min=1024, max=65535,
+    )
 
 
-# ---------------------INIT SCRIPT FUNCTIONS
-
-# I copied the blender camera parameter extraction code (following 2 functions) from stack exchange:
-# https://blender.stackexchange.com/questions/38009/3x4-camera-matrix-from-blender-camera
+# ===================== CAMERA MATH =====================
 
 
-# BKE_camera_sensor_size
 def get_sensor_size(sensor_fit, sensor_x, sensor_y):
     if sensor_fit == "VERTICAL":
         return sensor_y
     return sensor_x
 
 
-# BKE_camera_sensor_fit
 def get_sensor_fit(sensor_fit, size_x, size_y):
     if sensor_fit == "AUTO":
         if size_x >= size_y:
@@ -76,11 +98,6 @@ def get_sensor_fit(sensor_fit, size_x, size_y):
     return sensor_fit
 
 
-# Build intrinsic camera parameters from Blender camera data
-# See notes on this in
-# blender.stackexchange.com/questions/15102/what-is-blenders-camera-projection-matrix-model
-# as well as
-# https://blender.stackexchange.com/a/120063/3581
 def get_calibration_matrix_K_from_blender(camd):
     assert isinstance(camd, bpy.types.Camera)
     if camd.type != "PERSP":
@@ -107,35 +124,19 @@ def get_calibration_matrix_K_from_blender(camd):
     s_u = 1 / pixel_size_mm_per_px
     s_v = 1 / pixel_size_mm_per_px / pixel_aspect_ratio
 
-    # Parameters of intrinsic calibration matrix K
     u_0 = resolution_x_in_px / 2 - camd.shift_x * view_fac_in_px
     v_0 = resolution_y_in_px / 2 + camd.shift_y * view_fac_in_px / pixel_aspect_ratio
-    skew = 0  # only use rectangular pixels
+    skew = 0
 
     K = Matrix(((s_u, skew, u_0), (0, s_v, v_0), (0, 0, 1)))
     return K, {
         "width": resolution_x_in_px * scale,
         "height": resolution_y_in_px * scale,
         "focal_len": f_in_mm,
-    }  # For a simple pinhole model without distortions
+    }
 
 
-# Returns camera rotation and translation matrices from Blender.
-#
-# There are 3 coordinate systems involved:
-#    1. The World coordinates: "world"
-#       - right-handed
-#    2. The Blender camera coordinates: "bcam"
-#       - x is horizontal
-#       - y is up
-#       - right-handed: negative z look-at direction
-#    3. The desired computer vision camera coordinates: "cv"
-#       - x is horizontal
-#       - y is down (to align to the actual pixel coordinates
-#         used in digital images)
-#       - right-handed: positive z look-at direction
 def get_3x4_RT_matrix_from_blender(cam, to_cv: bool):
-    # bcam stands for blender camera
     R_bcam2cv = Matrix(
         (
             (1, 0, 0),
@@ -144,27 +145,13 @@ def get_3x4_RT_matrix_from_blender(cam, to_cv: bool):
         )
     )
 
-    # Transpose since the rotation is object rotation,
-    # and we want coordinate rotation
-    # R_world2bcam = cam.rotation_euler.to_matrix().transposed()
-    # T_world2bcam = -1*R_world2bcam @ cam.location
-    #
-    # Use matrix_world instead to account for all constraints
-    location, rotation = cam.matrix_world.decompose()[0:2]  # Vector, Quaternion
-    # Transpose to represent coordinate change instead of camera rotation (inverse)!
-    R_world2bcam = rotation.to_matrix().transposed()  # Quaternion to matrix.
-
-    # Convert camera location to translation vector used in coordinate changes
-    # Use location from matrix_world to account for constraints:
+    location, rotation = cam.matrix_world.decompose()[0:2]
+    R_world2bcam = rotation.to_matrix().transposed()
     T_world2bcam = -1 * R_world2bcam @ location
 
-    # Build the coordinate transform matrix from world to computer vision camera
-    # NOTE: Use * instead of @ here for older versions of Blender
-    # TODO: detect Blender version
     R_world2cv = R_bcam2cv @ R_world2bcam
     T_world2cv = R_bcam2cv @ T_world2bcam
 
-    # put into 3x4 matrix
     cvRT = Matrix(
         (
             R_world2cv[0][:] + (T_world2cv[0],),
@@ -190,171 +177,298 @@ def get_3x4_P_matrix_from_blender(cam, to_cv: bool):
     return K @ RT, K, intrinsics, RT
 
 
-def export_main_camera_animation(self, n_frames: int, output_path: Path):
-    """
-    Export the main camera animation poses for all frames.
-    This exports intrinsics and per-frame extrinsics (world2cam and cam2world).
-
-    Args:
-        n_frames: Number of frames in the animation
-        output_path: Path where to save the numpy files
-
-    Returns:
-        bool: True if export was successful, False if skipped
-    """
-    if n_frames <= 0:
-        print(
-            f"Warning: Invalid number of frames ({n_frames}). Skipping main camera export."
-        )
-        return False
-
-    scene = bpy.context.scene
-    main_cam = scene.camera
-    if main_cam is None:
-        self.report(
-            {"WARNING"}, "No main camera found in scene. Skipping main camera export."
-        )
-        return False
-    elif main_cam.name.startswith("Camera_"):
-        self.report(
-            {"WARNING"},
-            "The main camera appears to be one of the scaffold cameras. Skipping main camera export.",
-        )
-
-    if main_cam.data.type != "PERSP":
-        self.report(
-            {"WARNING"}, "Not a perspective camera. Skipping main camera export."
-        )
-        return False
-
-    fly_world2cams = np.zeros((n_frames, 3, 4), dtype=np.float32)
-    fly_cam2worlds = np.zeros((n_frames, 3, 4), dtype=np.float32)
-
-    # Get intrinsics (should be constant across frames for the main camera)
-    # Note: This assumes intrinsics are not animated. If animated intrinsics are needed,
-    # this should be moved inside the loop below.
-    _, K, pinhole_params, _ = get_3x4_P_matrix_from_blender(main_cam, to_cv=False)
-    fly_intrinsics = np.array(
-        [
-            pinhole_params["height"],
-            pinhole_params["width"],
-            pinhole_params["focal_len"],
-        ]
-    ).reshape((3, 1))
-    fly_full_intrinsics = K
-
-    original_frame = scene.frame_current
-    for frame_idx in range(n_frames):
-        scene.frame_set(frame_idx + 1)
-        cvRT = get_3x4_RT_matrix_from_blender(main_cam, to_cv=True)
-        # Build the full 4x4 transformation matrix
-        bottom = np.array([0, 0, 0, 1.0]).reshape([1, 4])
-        cvM = np.concatenate([cvRT, bottom], 0)
-        cv_cam2world = np.linalg.inv(cvM)
-        fly_world2cams[frame_idx] = cvRT  # world2cam (3, 4) matrix
-        fly_cam2worlds[frame_idx] = cv_cam2world[:3, :4]  # cam2world (3, 4) matrix
-
-    scene.frame_set(original_frame)
-    np.save(Path.joinpath(output_path, "fly_cam_intrinsics.npy"), fly_intrinsics)
-    np.save(
-        Path.joinpath(output_path, "fly_cam_full_intrinsics.npy"), fly_full_intrinsics
-    )
-    np.save(Path.joinpath(output_path, "fly_world2cam.npy"), fly_world2cams)
-    np.save(Path.joinpath(output_path, "fly_cam2world.npy"), fly_cam2worlds)
-    print(f"Exported main camera animation: {n_frames} frames")
-    print(f"  - fly_cam_intrinsics.npy: {fly_intrinsics.shape}")
-    print(f"  - fly_world2cam.npy: {fly_world2cams.shape}")
-    print(f"  - fly_cam2world.npy: {fly_cam2worlds.shape}")
-    return True
-
-
-# ---------------------MAIN FUNCTIONS
-
-
 def get_blender_camera_resolution(scene):
-    """Return (width, height) in pixels for the current render settings."""
     scale = scene.render.resolution_percentage / 100.0
     w = int(scene.render.resolution_x * scale)
     h = int(scene.render.resolution_y * scale)
     return w, h
 
 
-def init_splatbus(self, context):
-    print("Initializing splatbus...")
-    self.report({"INFO"}, "Connecting to SplatBus...")
-    self.client = GaussianSplattingIPCClient(
-        host="127.0.0.1", ipc_port=6001, msg_port=6000
-    )
-    try:
-        self.client.connect()
-    except Exception as e:
-        self.report(
-            {"ERROR"}, f"Failed to connect to Gaussian Splatting IPC Server: {e}"
-        )
-        return
-
-    scene = context.scene
-    self.width, self.height = get_blender_camera_resolution(scene)
-    print(f"Camera resolution: {self.width}x{self.height}")
-
-    t, quat = self.client.get_camera_pose(cam_idx=0)
-    print(f"Server initial pose — t: {t}, quat: {quat}")
+# ===================== CORE IPC FUNCTIONS =====================
 
 
-def on_render(self, context):
-    """Send the current Blender camera pose to the splatbus server."""
-    scene = context.scene
+def _send_pose():
+    if _state.client is None or not _state.client.connected:
+        return False
+    scene = bpy.context.scene
     cam = scene.camera
     if cam is None:
-        self.report({"WARNING"}, "No active camera in scene.")
-        return
+        return False
 
-    # Get the CV-convention world-to-camera 3x4 matrix
     cvRT = get_3x4_RT_matrix_from_blender(cam, to_cv=True)
-
-    # Extract rotation (3x3) and translation (3,)
     R = np.array([[cvRT[r][c] for c in range(3)] for r in range(3)])
     t = np.array([cvRT[r][3] for r in range(3)])
 
-    # Build cam-to-world: invert the 4x4
     bottom = np.array([[0.0, 0.0, 0.0, 1.0]])
     RT4 = np.concatenate([np.column_stack([R, t]), bottom], axis=0)
     c2w = np.linalg.inv(RT4)
-
-    # Camera centre in world space
     position = c2w[:3, 3]
-
-    # Rotation as quaternion (scipy: [x, y, z, w])
     q_xyzw = SciRot.from_matrix(c2w[:3, :3]).as_quat()
 
-    self.client.send_camera_pose(
+    _state.client.send_camera_pose(
         position={k: str(v) for k, v in zip("xyz", position)},
         rotation={k: str(v) for k, v in zip("xyzw", q_xyzw)},
     )
+    return True
 
 
-# ---------------------OPERATORS
+def _receive_frame() -> Optional[np.ndarray]:
+    if _state.client is None or not _state.client.connected:
+        return None
+    result = _state.client.receive()
+    if not result or "color" not in result:
+        return None
+    tensor = result["color"]
+    if tensor.is_cuda:
+        arr = tensor.cpu().numpy()
+    else:
+        arr = tensor.numpy()
+    return arr
 
 
-class InitSplatbusOperator(bpy.types.Operator):
-    bl_idname = "splatbus.init"
-    bl_label = "Init SplatBus"
+def _update_display_texture(color_np: np.ndarray):
+    if color_np is None or color_np.size == 0:
+        return
+    h, w = color_np.shape[:2]
+    uint8 = (np.clip(color_np[..., :3], 0, 1) * 255).astype(np.uint8)
+    rgba = np.empty((h, w, 4), dtype=np.uint8)
+    rgba[..., :3] = uint8
+    rgba[..., 3] = 255
+    _state.color_buffer_np = rgba
+    _state.width, _state.height = w, h
+    _state.gpu_texture = GPUTexture((w, h), format="RGBA8", data=rgba.flatten())
+
+
+def _update_compositor_image(color_np: np.ndarray):
+    if color_np is None or color_np.size == 0:
+        return
+    h, w = color_np.shape[:2]
+    img = bpy.data.images.get("SplatbusOutput")
+    if img is None:
+        img = bpy.data.images.new("SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True)
+    if img.size[0] != w or img.size[1] != h:
+        img.scale(w, h)
+    flat = np.empty(w * h * 4, dtype=np.float32)
+    flat[0::4] = color_np[..., 0].ravel()
+    flat[1::4] = color_np[..., 1].ravel()
+    flat[2::4] = color_np[..., 2].ravel()
+    single_alpha = color_np[..., 3:4].ravel() if color_np.shape[2] == 4 else np.ones(w * h, dtype=np.float32)
+    flat[3::4] = single_alpha
+    img.pixels = flat.tolist()
+
+
+# ===================== TICK =====================
+
+
+def _tick():
+    if not _state.is_running:
+        return None
+    if _state.client is None or not _state.client.connected:
+        _stop()
+        return None
+
+    try:
+        _send_pose()
+        color = _receive_frame()
+        if color is not None:
+            _update_display_texture(color)
+            _update_compositor_image(color)
+    except Exception:
+        traceback.print_exc()
+
+    return 1.0 / 30.0
+
+
+# ===================== VIEWPORT DRAW =====================
+
+
+def _draw_viewport():
+    tex = _state.gpu_texture
+    if tex is None:
+        return
+    region = bpy.context.region
+    if region is None:
+        return
+    w, h = region.width, region.height
+
+    gpu.state.blend_set("ALPHA")
+    shader = gpu.shader.from_builtin("2D_IMAGE")
+    shader.bind()
+    shader.uniform_sampler("image", tex)
+    batch = batch_for_shader(
+        shader, "TRI_FAN",
+        {
+            "pos": ((0, 0), (w, 0), (w, h), (0, h)),
+            "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1)),
+        },
+    )
+    batch.draw(shader)
+    gpu.state.blend_set("NONE")
+
+
+# ===================== LIFECYCLE =====================
+
+
+def _start():
+    if _state.is_running:
+        return
+    _state.is_running = True
+
+    _state.timer = bpy.app.timers.register(_tick, first_interval=0.0, persistent=True)
+
+    if _state.draw_handler is None:
+        _state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_viewport, (), "WINDOW", "POST_PIXEL"
+        )
+
+    if not _state.compositor_ready:
+        _setup_compositor()
+        _state.compositor_ready = True
+
+    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_pre):
+        if _on_frame_change not in h:
+            h.append(_on_frame_change)
+
+
+def _stop():
+    _state.is_running = False
+
+    if _state.timer is not None:
+        try:
+            bpy.app.timers.unregister(_tick)
+        except ValueError:
+            pass
+        _state.timer = None
+
+    if _state.draw_handler is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_state.draw_handler, "WINDOW")
+        except (ValueError, RuntimeError):
+            pass
+        _state.draw_handler = None
+
+    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_pre):
+        try:
+            h.remove(_on_frame_change)
+        except ValueError:
+            pass
+
+    _state.gpu_texture = None
+
+
+def _on_frame_change(_scene=None, _depsgraph=None):
+    if not _state.is_running:
+        return
+    try:
+        _send_pose()
+        color = _receive_frame()
+        if color is not None:
+            _update_compositor_image(color)
+    except Exception:
+        traceback.print_exc()
+
+
+# ===================== COMPOSITOR =====================
+
+
+def _setup_compositor():
+    scene = bpy.context.scene
+    scene.use_nodes = True
+    tree = scene.node_tree
+    if tree is None:
+        return
+
+    if any(n.type == "IMAGE" and n.image and n.image.name == "SplatbusOutput" for n in tree.nodes):
+        return
+
+    w, h = _state.width or 1920, _state.height or 1080
+    img = bpy.data.images.get("SplatbusOutput")
+    if img is None:
+        img = bpy.data.images.new("SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True)
+
+    rl = tree.nodes.new("CompositorNodeRLayers")
+    rl.location = (0, 0)
+
+    img_node = tree.nodes.new("CompositorNodeImage")
+    img_node.location = (0, 200)
+    img_node.image = img
+
+    alpha_over = tree.nodes.new("CompositorNodeAlphaOver")
+    alpha_over.location = (400, 0)
+
+    composite = tree.nodes.new("CompositorNodeComposite")
+    composite.location = (600, 0)
+
+    tree.links.new(img_node.outputs["Image"], alpha_over.inputs[2])
+    tree.links.new(rl.outputs["Image"], alpha_over.inputs[1])
+    tree.links.new(alpha_over.outputs["Image"], composite.inputs["Image"])
+
+
+# ===================== OPERATORS =====================
+
+
+class SplatbusConnectOperator(bpy.types.Operator):
+    bl_idname = "splatbus.connect"
+    bl_label = "Connect to SplatBus"
+    bl_description = "Connect to the SplatBus Gaussian Splatting server and start the render loop"
 
     def execute(self, context):
-        init_splatbus(self, context)
+        if _state.is_running:
+            self.report({"INFO"}, "Already connected")
+            return {"CANCELLED"}
+
+        props = context.scene.splatbus_setup
+        _state.client = GaussianSplattingIPCClient(
+            host=props.host, ipc_port=props.ipc_port, msg_port=props.msg_port,
+        )
+        try:
+            _state.client.connect()
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to connect: {e}")
+            _state.client = None
+            return {"CANCELLED"}
+
+        scene = context.scene
+        _state.width, _state.height = get_blender_camera_resolution(scene)
+
+        t, quat = _state.client.get_camera_pose(cam_idx=0)
+        print(f"[Splatbus] Server initial pose — t: {t}, quat: {quat}")
+
+        _start()
+        self.report({"INFO"}, "Connected to SplatBus")
         return {"FINISHED"}
 
 
-class ApplySplatbusOperator(bpy.types.Operator):
-    bl_idname = "splatbus.setup"
-    bl_label = "Apply splatbus config"
+class SplatbusDisconnectOperator(bpy.types.Operator):
+    bl_idname = "splatbus.disconnect"
+    bl_label = "Disconnect SplatBus"
+    bl_description = "Disconnect from the SplatBus server and stop the render loop"
 
     def execute(self, context):
-        # setup_scaffold(self, context)
+        _stop()
+        if _state.client is not None:
+            _state.client.close()
+            _state.client = None
+        _state.color_buffer_np = None
+        _state.gpu_texture = None
+        self.report({"INFO"}, "Disconnected from SplatBus")
         return {"FINISHED"}
 
 
-# ---------------------PANEL LAYOUT
+class SplatbusSetupCompositorOperator(bpy.types.Operator):
+    bl_idname = "splatbus.setup_compositor"
+    bl_label = "Setup Compositor"
+    bl_description = "Create compositor nodes to composite SplatBus output over the final render"
+
+    def execute(self, context):
+        _state.width, _state.height = get_blender_camera_resolution(context.scene)
+        _setup_compositor()
+        _state.compositor_ready = True
+        self.report({"INFO"}, "Compositor nodes created")
+        return {"FINISHED"}
+
+
+# ===================== PANEL =====================
 
 
 class SCENE_PT_splatbus(bpy.types.Panel):
@@ -367,45 +481,78 @@ class SCENE_PT_splatbus(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
-
         props = context.scene.splatbus_setup
-        # Camera init properties
-        layout.label(text="Settings", icon="OUTLINER_OB_CAMERA")
 
-        box0 = layout.box()
-        box0.operator("splatbus.init")
+        box = layout.box()
+        box.label(text="Connection", icon="WORLD_DATA")
+        box.prop(props, "host")
+        row = box.row()
+        row.prop(props, "ipc_port")
+        row.prop(props, "msg_port")
 
-        # Individual camera settings
-        box1 = layout.box()
-        box1.prop(props, "in_use")
-        # Apply button
         row = layout.row()
+        row.scale_y = 1.4
+        if _state.is_running:
+            row.operator("splatbus.disconnect", icon="PAUSE")
+        else:
+            row.operator("splatbus.connect", icon="PLAY")
+
+        layout.separator()
+
+        box = layout.box()
+        box.label(text="Compositor", icon="NODETREE")
+        box.prop(props, "in_use")
+        box.operator("splatbus.setup_compositor", icon="NODETREE")
+
+        col = layout.column()
+        col.enabled = _state.is_running
+        row = col.row()
         row.scale_y = 1.75
         row.scale_x = 1.75
-        box = row.box()
-        box.operator("splatbus.setup")
+
+        if not _state.is_running:
+            info = layout.box()
+            info.label(text="Not connected", icon="ERROR")
+        else:
+            box = layout.box()
+            box.label(text=f"Streaming {_state.width}x{_state.height}", icon="RENDER_RESULT")
 
 
-# ---------------------REGISTRATION
+# ===================== REGISTRATION =====================
+
 
 classes = (
     SplatbusProperties,
-    InitSplatbusOperator,
-    ApplySplatbusOperator,
+    SplatbusConnectOperator,
+    SplatbusDisconnectOperator,
+    SplatbusSetupCompositorOperator,
     SCENE_PT_splatbus,
 )
+
+
+@bpy.app.handlers.persistent
+def _load_handler(_dummy):
+    pass  # placeholder for future reload-state logic
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.splatbus_setup = bpy.props.PointerProperty(type=SplatbusProperties)
+    bpy.types.Scene.splatbus_setup = PointerProperty(type=SplatbusProperties)
+    bpy.app.handlers.load_post.append(_load_handler)
 
 
 def unregister():
-    for cls in classes:
-        bpy.utils.unregister_class(cls)
+    _stop()
+    if _state.client is not None:
+        _state.client.close()
+        _state.client = None
+
+    bpy.app.handlers.load_post.remove(_load_handler)
+
     del bpy.types.Scene.splatbus_setup
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
 
 
 if __name__ == "__main__":
