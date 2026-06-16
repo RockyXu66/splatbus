@@ -23,3 +23,8 @@ clean:
 .PHONY: build
 build: pull-deps
 	python3 build_addon.py "$(BLENDER)"
+
+# Pull deps, build splatbus wheel, then package the Blender extension
+.PHONY: build-linux
+build-linux: pull-deps
+	python3 build_addon.py "$(BLENDER)" --platform linux-x64

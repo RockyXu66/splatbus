@@ -7,6 +7,8 @@ bl_info = {
     "description": "Gaussian Splating unified rendering interface",
 }
 
+import os
+import subprocess
 import sys
 import traceback
 from typing import Optional
@@ -28,6 +30,26 @@ try:
     import torch
 except ImportError:
     torch = None  # will be caught at connect time
+
+
+# ===================== TORCH INSTALL HELPERS =====================
+
+
+def _get_ext_site_packages() -> Optional[str]:
+    """Find the extension-local site-packages directory from sys.path."""
+    for p in sys.path:
+        if 'extensions' in p and 'site-packages' in p:
+            return p
+    return None
+
+
+def _find_uv() -> Optional[str]:
+    """Locate the uv binary on PATH."""
+    for path_dir in os.environ.get('PATH', '').split(os.pathsep):
+        candidate = os.path.join(path_dir, 'uv')
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 # ===================== STATE =====================
@@ -226,13 +248,8 @@ def _update_display_texture(color_np: np.ndarray):
     if color_np is None or color_np.size == 0:
         return
     h, w = color_np.shape[:2]
-    uint8 = (np.clip(color_np[..., :3], 0, 1) * 255).astype(np.uint8)
-    rgba = np.empty((h, w, 4), dtype=np.uint8)
-    rgba[..., :3] = uint8
-    rgba[..., 3] = 255
-    _state.color_buffer_np = rgba
     _state.width, _state.height = w, h
-    _state.gpu_texture = GPUTexture((w, h), format="RGBA8", data=rgba.flatten())
+    _state.color_buffer_np = (np.clip(color_np[..., :3], 0, 1) * 255).astype(np.uint8)
 
 
 def _update_compositor_image(color_np: np.ndarray):
@@ -250,6 +267,7 @@ def _update_compositor_image(color_np: np.ndarray):
     flat[2::4] = color_np[..., 2].ravel()
     flat[3::4] = 1.0
     img.pixels.foreach_set(flat)
+    img.update()
 
 
 # ===================== TICK =====================
@@ -278,15 +296,16 @@ def _tick():
 
 
 def _draw_viewport():
-    tex = _state.gpu_texture
-    if tex is None:
+    img = bpy.data.images.get("SplatbusOutput")
+    if img is None:
         return
+    tex = gpu.texture.from_image(img)
     region = bpy.context.region
     if region is None:
         return
     w, h = region.width, region.height
 
-    shader = gpu.shader.from_builtin("2D_IMAGE")
+    shader = gpu.shader.from_builtin("IMAGE")
     shader.bind()
     shader.uniform_sampler("image", tex)
     shader.uniform_vector_float("color", (1.0, 1.0, 1.0, 1.0), 4)
@@ -471,6 +490,76 @@ class SplatbusDisconnectOperator(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SplatbusInstallTorchOperator(bpy.types.Operator):
+    bl_idname = "splatbus.install_torch"
+    bl_label = "Install PyTorch"
+    bl_description = "Download and install PyTorch with CUDA support"
+
+    _process = None
+    _timer = None
+    _elapsed = 0
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+        if self._process is None:
+            return {'FINISHED'}
+
+        wm = context.window_manager
+        ret = self._process.poll()
+        if ret is None:
+            self._elapsed += 1
+            secs = self._elapsed
+            wm.progress_update(secs % 100)
+            if secs <= 15 or secs % 5 == 0:
+                self.report({'INFO'}, f"Installing PyTorch... ({secs}s elapsed)")
+            return {'PASS_THROUGH'}
+
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+        wm.progress_end()
+
+        stdout, stderr = self._process.communicate()
+        if ret != 0:
+            msg = (stderr or b'').decode(errors='replace')[:300]
+            self.report({'ERROR'}, f"Installation failed: {msg}")
+            return {'FINISHED'}
+
+        self.report({'INFO'}, "PyTorch installed! Please save your work and restart Blender.")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        target = _get_ext_site_packages()
+        if target is None:
+            self.report({'ERROR'}, "Cannot locate extension site-packages directory")
+            return {'CANCELLED'}
+
+        blender_python = sys.executable
+        uv_path = _find_uv()
+        idx_url = "https://download.pytorch.org/whl/cu124"
+
+        if uv_path:
+            cmd = [uv_path, 'pip', 'install', 'torch',
+                   '--index-url', idx_url,
+                   '--python', blender_python,
+                   '--target', target]
+        else:
+            cmd = [blender_python, '-m', 'pip', 'install', 'torch',
+                   '--index-url', idx_url,
+                   '--target', target]
+
+        self._elapsed = 0
+        self.report({'INFO'}, "Installing PyTorch...")
+        self._process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        self._timer = wm.event_timer_add(1.0, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+
 class SplatbusSetupCompositorOperator(bpy.types.Operator):
     bl_idname = "splatbus.setup_compositor"
     bl_label = "Setup Compositor"
@@ -498,6 +587,15 @@ class SCENE_PT_splatbus(bpy.types.Panel):
         layout = self.layout
         layout.use_property_split = True
         props = context.scene.splatbus_setup
+
+        if torch is None:
+            box = layout.box()
+            box.label(text="PyTorch not found", icon="ERROR")
+            box.label(text="SplatBus requires PyTorch with CUDA.")
+            row = box.row()
+            row.scale_y = 1.5
+            row.operator("splatbus.install_torch", icon="IMPORT")
+            return
 
         box = layout.box()
         box.label(text="Connection", icon="WORLD_DATA")
@@ -541,6 +639,7 @@ classes = (
     SplatbusProperties,
     SplatbusConnectOperator,
     SplatbusDisconnectOperator,
+    SplatbusInstallTorchOperator,
     SplatbusSetupCompositorOperator,
     SCENE_PT_splatbus,
 )
