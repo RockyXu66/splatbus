@@ -1,0 +1,105 @@
+schema_version = "1.0.0"
+
+# This blender addon is built with the tool: https://github.com/ego-lay-atman-bay/blender-extension-builder
+# Thanks to the author!
+
+# Example of manifest file for a Blender extension
+# Change the values according to your extension
+id = "splatbus"
+version = "0.0.1"
+name = "Splatbus"
+tagline = "A unified Gaussian Splatting interface"
+maintainer = "Théo Morales, Yinghan Xu"
+# Supported types: "add-on", "theme"
+type = "add-on"
+
+# # Optional: link to documentation, support, source files, etc
+# website = "https://extensions.blender.org/add-ons/my-example-package/"
+
+# # Optional: tag list defined by Blender and server, see:
+# # https://docs.blender.org/manual/en/dev/advanced/extensions/tags.html
+# tags = ["Animation", "Sequencer"]
+
+blender_version_min = "4.2.0"
+# # Optional: Blender version that the extension does not support, earlier versions are supported.
+# # This can be omitted and defined later on the extensions platform if an issue is found.
+# blender_version_max = "5.1.0"
+
+# License conforming to https://spdx.org/licenses/ (use "SPDX: prefix)
+# https://docs.blender.org/manual/en/dev/advanced/extensions/licenses.html
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+# # Optional: required by some licenses.
+# copyright = [
+#   "2002-2024 Developer Name",
+#   "1998 Company Name",
+# ]
+
+# # Optional: list of supported platforms. If omitted, the extension will be available in all operating systems.
+platforms = ["windows-x64", "macos-arm64", "linux-x64"]
+# # Other supported platforms: "windows-arm64", "macos-x64"
+
+dependencies = [
+  # "numpy",
+  # "scipy",
+  "torch>=2.0.0",
+  "loguru>=0.7.0",
+]
+
+# Folder to store the wheels in the addon.
+wheel-path = './wheels'
+
+
+# Wheels are auto-discovered by build_addon.py from the ./wheels directory.
+	
+# Use this if blender is skipping a wheel for python version
+# incompatibility (even though it's compatible)
+# This can also be enabled in the commandline with `--ensure-cp311` or `-cp311`
+ensure-cp311 = true
+# # Optional: add-ons can list which resources they will require:
+# # * files (for access of any filesystem operations)
+# # * network (for internet access)
+# # * clipboard (to read and/or write the system clipboard)
+# # * camera (to capture photos and videos)
+# # * microphone (to capture audio)
+# #
+# # If using network, remember to also check `bpy.app.online_access`
+# # https://docs.blender.org/manual/en/dev/advanced/extensions/addons.html#internet-access
+# #
+# # For each permission it is important to also specify the reason why it is required.
+# # Keep this a single short sentence without a period (.) at the end.
+# # For longer explanations use the documentation or detail page.
+#
+# [permissions]
+# network = "Need to sync motion-capture data to server"
+# files = "Import/export FBX from/to disk"
+# clipboard = "Copy and paste bone transforms"
+
+# # Optional: advanced build settings.
+# # https://docs.blender.org/manual/en/dev/advanced/extensions/command_line_arguments.html#command-line-args-extension-build
+[build]
+# Some optional extra options were added to this table
+
+# Folder containing the source code of the extension. Defaults to the current directory
+source = './src'
+# Folder for where the extension will be stored
+# with all the files (to build the extension). Defaults to ./build
+build = './build'
+# Output folder for the built addon in the .zip file.
+dist = './dist'
+
+# This contains a list of files or folders to keep in the built extension.
+paths = [
+  'LICENSE',
+  'README.md',
+]
+
+
+# # These are the default build excluded patterns.
+# # You only need to edit them if you want different options.
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+]
