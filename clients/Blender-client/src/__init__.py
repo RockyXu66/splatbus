@@ -211,18 +211,20 @@ def _send_pose(c2w=None):
     return True
 
 
-def _receive_frame() -> Optional[np.ndarray]:
+def _receive_frames() -> dict:
     if _state.client is None or not _state.client.connected:
-        return None
+        return {}
     result = _state.client.receive()
-    if not result or "color" not in result:
-        return None
-    tensor = result["color"]
-    if tensor.is_cuda:
-        arr = tensor.cpu().numpy()
-    else:
-        arr = tensor.numpy()
-    return arr
+    if not result:
+        return {}
+    frames = {}
+    if "color" in result:
+        tensor = result["color"]
+        frames["color"] = tensor.cpu().numpy() if tensor.is_cuda else tensor.numpy()
+    if "depth" in result:
+        tensor = result["depth"]
+        frames["depth"] = tensor.cpu().numpy() if tensor.is_cuda else tensor.numpy()
+    return frames
 
 
 def _safe_close_client(client):
@@ -264,13 +266,45 @@ def _safe_close_client(client):
         traceback.print_exc()
 
 
-def _update_blender_image(color_np: np.ndarray, touch_gpu: bool = False):
-    """Update the SplatbusOutput image pixels from a numpy RGB frame."""
+def _update_depth_image(depth_np: np.ndarray):
+    """Update the SplatbusDepth image from a 1‑channel depth numpy array."""
+    if depth_np is None or depth_np.size == 0:
+        return None
+    # Server depth is already flipped by ClientBuffer to top‑down (CV2);
+    # Blender expects bottom‑up (OpenGL).
+    depth_np = np.flipud(depth_np)
+    h, w = depth_np.shape[:2]
+    img = bpy.data.images.get("SplatbusDepth")
+    if img is None or img.size[0] != w or img.size[1] != h:
+        if img is not None:
+            bpy.data.images.remove(img)
+        img = bpy.data.images.new("SplatbusDepth", width=w, height=h, alpha=False, float_buffer=True)
+        img.use_fake_user = True
+    flat = np.empty(w * h * 4, dtype=np.float32)
+    flat[0::4] = depth_np.ravel()
+    flat[1::4] = depth_np.ravel()
+    flat[2::4] = depth_np.ravel()
+    flat[3::4] = 1.0
+    img.pixels.foreach_set(flat)
+    img.update()
+    img.update_tag()
+    return img
+
+
+def _update_blender_image(color_np: np.ndarray, touch_gpu: bool = False, alpha_mask: np.ndarray = None):
+    """Update the SplatbusOutput image pixels from a numpy RGB(A) frame.
+
+    The server's alpha channel is not meaningful (it is 1.0 everywhere), so the
+    alpha channel of the Blender image is computed from ``alpha_mask`` when
+    provided. When not provided it falls back to the maximum RGB value.
+    """
     if color_np is None or color_np.size == 0:
         return None
     # ClientBuffer flips the server image to top-down (CV2) order; Blender's
     # Image.pixels / gpu textures expect bottom-up (OpenGL) order.
     color_np = np.flipud(color_np)
+    if alpha_mask is not None:
+        alpha_mask = np.flipud(alpha_mask)
     h, w = color_np.shape[:2]
     _state.width, _state.height = w, h
     img = bpy.data.images.get("SplatbusOutput")
@@ -283,7 +317,12 @@ def _update_blender_image(color_np: np.ndarray, touch_gpu: bool = False):
     flat[0::4] = color_np[..., 0].ravel()
     flat[1::4] = color_np[..., 1].ravel()
     flat[2::4] = color_np[..., 2].ravel()
-    flat[3::4] = 1.0
+    if alpha_mask is not None:
+        flat[3::4] = alpha_mask.ravel()
+    elif color_np.shape[2] == 4 and color_np[..., 3].max() < 0.999:
+        flat[3::4] = color_np[..., 3].ravel()
+    else:
+        flat[3::4] = np.maximum(np.maximum(color_np[..., 0], color_np[..., 1]), color_np[..., 2]).ravel()
     img.pixels.foreach_set(flat)
     img.update()
     img.update_tag()
@@ -292,9 +331,13 @@ def _update_blender_image(color_np: np.ndarray, touch_gpu: bool = False):
     return img
 
 
-def _update_compositor_image(color_np: np.ndarray):
+def _update_compositor_image(color_np: np.ndarray, depth_np: np.ndarray = None):
     """Update the compositor image and the viewport GPU texture."""
-    img = _update_blender_image(color_np, touch_gpu=True)
+    alpha_mask = None
+    if depth_np is not None and depth_np.size > 0:
+        # Pixels with the sentinel depth value (>= 100.0) are empty background.
+        alpha_mask = (depth_np < 99.9).astype(np.float32)
+    img = _update_blender_image(color_np, touch_gpu=True, alpha_mask=alpha_mask)
     if img is None:
         return
     tex = gpu.texture.from_image(img)
@@ -326,14 +369,17 @@ def _tick():
     try:
         c2w = _get_viewport_camera_matrix()
         _send_pose(c2w)
-        color = _receive_frame()
-        if color is not None:
-            if _state.is_rendering:
-                # Skip GPU texture creation while a render is in progress to
-                # avoid touching the GL context at a bad time.
-                _update_blender_image(color)
-            else:
-                _update_compositor_image(color)
+        frames = _receive_frames()
+        if frames:
+            color = frames.get("color")
+            depth = frames.get("depth")
+            if color is not None:
+                if _state.is_rendering:
+                    _update_blender_image(color, alpha_mask=(depth < 99.9).astype(np.float32) if depth is not None else None)
+                else:
+                    _update_compositor_image(color, depth)
+            if depth is not None:
+                _update_depth_image(depth)
     except Exception:
         traceback.print_exc()
 
@@ -444,13 +490,39 @@ def _on_frame_change(_scene=None, _depsgraph=None):
         print(f"[Splatbus] render/frame handler fired")
         c2w = _get_scene_camera_matrix()
         _send_pose(c2w)
-        color = _receive_frame()
-        print(f"[Splatbus] received frame: {color is not None}, shape={color.shape if color is not None else None}")
+        frames = _receive_frames()
+        color = frames.get("color")
+        depth = frames.get("depth")
+        print(f"[Splatbus] received frame: color={color is not None}, depth={depth is not None}, shape={color.shape if color is not None else None}")
         if color is not None:
-            # During render there is no active GPU context; only update the
-            # Blender image pixels, not the viewport texture.
-            img = _update_blender_image(color)
-            print(f"[Splatbus] updated image: {img}, size={img.size if img else None}, mean={color.mean():.4f}")
+            alpha_mask = None
+            if depth is not None and depth.size > 0:
+                alpha_mask = (depth < 99.9).astype(np.float32)
+            img = _update_blender_image(color, alpha_mask=alpha_mask)
+            print(f"[Splatbus] updated color image: {img}, size={img.size if img else None}")
+            print(f"[Splatbus] color shape: {color.shape}, dtype: {color.dtype}")
+            print(f"[Splatbus] RGB mean: {color[..., :3].mean():.4f}, alpha mean: {alpha_mask.mean() if alpha_mask is not None else -1:.4f}")
+            if color.shape[2] == 4:
+                alpha = color[..., 3]
+                print(f"[Splatbus] server alpha stats: min={alpha.min():.4f}, max={alpha.max():.4f}, nonzero={np.count_nonzero(alpha)}")
+        if depth is not None:
+            _update_depth_image(depth)
+            print(f"[Splatbus] depth min={depth.min():.4f} max={depth.max():.4f}")
+
+        # ── Force compositor Image nodes to refresh after update ──
+        try:
+            scene = bpy.context.scene
+            if scene.node_tree is not None:
+                for node in scene.node_tree.nodes:
+                    if node.type == "IMAGE" and node.image is not None:
+                        if node.image.name in ("SplatbusOutput", "SplatbusDepth"):
+                            img = node.image
+                            node.image = None
+                            node.image = img
+                            print(f"[Splatbus] refreshed compositor image node: {img.name}")
+                scene.node_tree.update_tag()
+        except Exception as refresh_err:
+            print(f"[Splatbus] image node refresh failed: {refresh_err}")
     except Exception:
         traceback.print_exc()
 
@@ -467,11 +539,17 @@ def _on_render_complete(_scene=None):
 def _setup_compositor():
     scene = bpy.context.scene
     scene.use_nodes = True
-    # Make the render background transparent so the Splatbus image shows through
-    # wherever there is no Blender geometry.
     scene.render.film_transparent = True
+    # Ensure compositing is actually executed during renders.
+    try:
+        scene.render.use_compositing = True
+    except Exception:
+        pass
+    # Enable the Z‑depth pass for depth‑based compositing.
+    scene.view_layers[0].use_pass_z = True
     tree = scene.node_tree
     if tree is None:
+        print("[Splatbus] ERROR: scene.node_tree is None")
         return
 
     # Remove all existing compositor nodes so repeated clicks always give a
@@ -480,35 +558,124 @@ def _setup_compositor():
         tree.nodes.remove(n)
 
     w, h = _state.width or 1920, _state.height or 1080
-    img = bpy.data.images.get("SplatbusOutput")
-    if img is None or img.size[0] != w or img.size[1] != h:
-        if img is not None:
-            bpy.data.images.remove(img)
-        img = bpy.data.images.new("SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True)
-        img.use_fake_user = True
-        # Ensure the image has a GPU-side representation so the compositor can
-        # read it even if no viewport frame has been rendered yet.
+    print(f"[Splatbus] Setting up compositor for {w}x{h}")
+
+    # ── Splatbus colour image ──
+    img_color = bpy.data.images.get("SplatbusOutput")
+    if img_color is None or img_color.size[0] != w or img_color.size[1] != h:
+        if img_color is not None:
+            bpy.data.images.remove(img_color)
+        img_color = bpy.data.images.new(
+            "SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True
+        )
+        img_color.use_fake_user = True
         if bpy.context.window is not None:
-            img.gl_touch()
+            img_color.gl_touch()
+
+    # ── Splatbus depth image ──
+    img_depth = bpy.data.images.get("SplatbusDepth")
+    if img_depth is None or img_depth.size[0] != w or img_depth.size[1] != h:
+        if img_depth is not None:
+            bpy.data.images.remove(img_depth)
+        img_depth = bpy.data.images.new(
+            "SplatbusDepth", width=w, height=h, alpha=False, float_buffer=True
+        )
+        img_depth.use_fake_user = True
+        # Depth is a data buffer, not a colour image.
+        if img_depth.colorspace_settings is not None:
+            try:
+                img_depth.colorspace_settings.name = "Non-Color"
+            except Exception:
+                pass
+        if bpy.context.window is not None:
+            img_depth.gl_touch()
+
+    print(f"[Splatbus] compositor images: color={img_color}, depth={img_depth}, color.size={img_color.size[:]}, depth.size={img_depth.size[:]}")
 
     rl = tree.nodes.new("CompositorNodeRLayers")
-    rl.location = (-400, 0)
+    rl.location = (-900, 0)
 
-    img_node = tree.nodes.new("CompositorNodeImage")
-    img_node.location = (-400, 250)
-    img_node.image = img
+    node_color = tree.nodes.new("CompositorNodeImage")
+    node_color.location = (-900, 300)
+    node_color.image = img_color
 
-    alpha_over = tree.nodes.new("CompositorNodeAlphaOver")
-    alpha_over.location = (0, 0)
+    node_depth = tree.nodes.new("CompositorNodeImage")
+    node_depth.location = (-900, 550)
+    node_depth.image = img_depth
+
+    # ── Depth-based compositing ──
+    # The server's alpha channel is 1.0 everywhere, so we build a mask from the
+    # depth buffer instead:
+    #   mask = (SplatbusDepth < BlenderZ  OR  BlenderAlpha == 0)
+    #          AND (SplatbusDepth < 100.0)
+    # The first term occludes Blender geometry that is behind the splats. The
+    # second term handles transparent background pixels, whose Z-pass is 0. The
+    # third term discards empty background pixels from the server.
+
+    # Extract depth value from the SplatbusDepth image (stored in RGB channels).
+    sep_depth = tree.nodes.new("CompositorNodeSepRGBA")
+    sep_depth.location = (-700, 550)
+    tree.links.new(node_depth.outputs["Image"], sep_depth.inputs[0])
+
+    # Empty-pixel guard: depth < 99.9 → 1.0, else 0.0
+    empty_mask = tree.nodes.new("CompositorNodeMath")
+    empty_mask.operation = "LESS_THAN"
+    empty_mask.inputs[1].default_value = 99.9
+    empty_mask.location = (-500, 700)
+    tree.links.new(sep_depth.outputs["R"], empty_mask.inputs[0])
+
+    # Depth comparison: splatbus depth < Blender Z-pass → 1.0, else 0.0
+    depth_diff = tree.nodes.new("CompositorNodeMath")
+    depth_diff.operation = "SUBTRACT"
+    depth_diff.location = (-500, 500)
+    tree.links.new(sep_depth.outputs["R"], depth_diff.inputs[0])
+    tree.links.new(rl.outputs["Depth"], depth_diff.inputs[1])
+
+    depth_mask_lt = tree.nodes.new("CompositorNodeMath")
+    depth_mask_lt.operation = "LESS_THAN"
+    depth_mask_lt.inputs[1].default_value = 0.0
+    depth_mask_lt.location = (-300, 500)
+    tree.links.new(depth_diff.outputs[0], depth_mask_lt.inputs[0])
+
+    # Background mask: Blender render alpha == 0 → 1.0, else 0.0
+    bg_mask = tree.nodes.new("CompositorNodeMath")
+    bg_mask.operation = "LESS_THAN"
+    bg_mask.inputs[1].default_value = 0.001
+    bg_mask.location = (-500, 300)
+    tree.links.new(rl.outputs["Alpha"], bg_mask.inputs[0])
+
+    # Combine: show Splatbus if it is closer OR if Blender has no geometry.
+    depth_mask = tree.nodes.new("CompositorNodeMath")
+    depth_mask.operation = "MAXIMUM"
+    depth_mask.location = (-100, 500)
+    tree.links.new(depth_mask_lt.outputs[0], depth_mask.inputs[0])
+    tree.links.new(bg_mask.outputs[0], depth_mask.inputs[1])
+
+    # Final mask = depth_mask * empty_mask
+    final_mask = tree.nodes.new("CompositorNodeMath")
+    final_mask.operation = "MULTIPLY"
+    final_mask.location = (100, 600)
+    tree.links.new(depth_mask.outputs[0], final_mask.inputs[0])
+    tree.links.new(empty_mask.outputs[0], final_mask.inputs[1])
+
+    # Composite: show Splatbus where mask=1, Blender render where mask=0.
+    # In Blender 4.x MixRGB, Fac=1 selects input 2 and Fac=0 selects input 1,
+    # so Splatbus must be wired to input 2 and the render to input 1.
+    mix = tree.nodes.new("CompositorNodeMixRGB")
+    mix.location = (300, 0)
+    mix.blend_type = "MIX"
 
     composite = tree.nodes.new("CompositorNodeComposite")
-    composite.location = (300, 0)
+    composite.location = (600, 0)
 
-    # AlphaOver composites foreground over background.
-    # In this build: input 1 = background, input 2 = foreground.
-    tree.links.new(img_node.outputs["Image"], alpha_over.inputs[1])
-    tree.links.new(rl.outputs["Image"], alpha_over.inputs[2])
-    tree.links.new(alpha_over.outputs["Image"], composite.inputs["Image"])
+    tree.links.new(rl.outputs["Image"], mix.inputs[1])
+    tree.links.new(node_color.outputs["Image"], mix.inputs[2])
+    tree.links.new(final_mask.outputs[0], mix.inputs[0])
+    tree.links.new(mix.outputs["Image"], composite.inputs["Image"])
+
+    # Force the node tree to refresh.
+    tree.update_tag()
+    print(f"[Splatbus] Compositor setup complete: {len(tree.nodes)} nodes")
 
 
 # ===================== OPERATORS =====================
@@ -556,6 +723,8 @@ class SplatbusConnectOperator(bpy.types.Operator):
         # compositor image does not get recreated (and lose its GPU texture) on
         # the first render.
         sv_w, sv_h = _state.client.get_viewport_size()
+        print(f"[Splatbus] Server viewport size: {sv_w}x{sv_h}")
+        print(f"[Splatbus] Blender render resolution: {scene.render.resolution_x}x{scene.render.resolution_y} ({scene.render.resolution_percentage}%)")
         if sv_w <= 0 or sv_h <= 0:
             sv_w, sv_h = get_blender_camera_resolution(scene)
         _state.width, _state.height = sv_w, sv_h
