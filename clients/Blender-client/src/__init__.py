@@ -291,12 +291,15 @@ def _update_depth_image(depth_np: np.ndarray):
     return img
 
 
-def _update_blender_image(color_np: np.ndarray, touch_gpu: bool = False, alpha_mask: np.ndarray = None):
+def _update_blender_image(color_np: np.ndarray, alpha_mask: np.ndarray = None):
     """Update the SplatbusOutput image pixels from a numpy RGB(A) frame.
 
     The server's alpha channel is not meaningful (it is 1.0 everywhere), so the
     alpha channel of the Blender image is computed from ``alpha_mask`` when
     provided. When not provided it falls back to the maximum RGB value.
+
+    This function is CPU-only; it never touches GPU resources so it is safe to
+    call from timers and render handlers.
     """
     if color_np is None or color_np.size == 0:
         return None
@@ -326,22 +329,19 @@ def _update_blender_image(color_np: np.ndarray, touch_gpu: bool = False, alpha_m
     img.pixels.foreach_set(flat)
     img.update()
     img.update_tag()
-    if touch_gpu:
-        img.gl_touch()
     return img
 
 
 def _update_compositor_image(color_np: np.ndarray, depth_np: np.ndarray = None):
-    """Update the compositor image and the viewport GPU texture."""
+    """Update the compositor image pixels. GPU texture is rebuilt lazily in the
+    viewport draw handler where a valid OpenGL context is guaranteed."""
     alpha_mask = None
     if depth_np is not None and depth_np.size > 0:
         # Pixels with the sentinel depth value (>= 100.0) are empty background.
         alpha_mask = (depth_np < 99.9).astype(np.float32)
-    img = _update_blender_image(color_np, touch_gpu=True, alpha_mask=alpha_mask)
-    if img is None:
-        return
-    tex = gpu.texture.from_image(img)
-    _state.gpu_texture = tex
+    _update_blender_image(color_np, alpha_mask=alpha_mask)
+    # Invalidate the cached GPU texture so the draw handler rebuilds it safely.
+    _state.gpu_texture = None
 
 
 # ===================== TICK =====================
@@ -390,9 +390,20 @@ def _tick():
 
 
 def _draw_viewport():
+    img = bpy.data.images.get("SplatbusOutput")
+    if img is None:
+        return
+
+    # Lazily rebuild the GPU texture inside the draw handler where a valid
+    # OpenGL context is guaranteed. Never create it from timer callbacks.
     tex = _state.gpu_texture
     if tex is None:
-        return
+        try:
+            tex = gpu.texture.from_image(img)
+        except Exception:
+            return
+        _state.gpu_texture = tex
+
     region = bpy.context.region
     if region is None:
         return
@@ -499,6 +510,9 @@ def _on_frame_change(_scene=None, _depsgraph=None):
             if depth is not None and depth.size > 0:
                 alpha_mask = (depth < 99.9).astype(np.float32)
             img = _update_blender_image(color, alpha_mask=alpha_mask)
+            # The image pixels changed; invalidate the viewport GPU texture so
+            # it is rebuilt safely in the next draw handler call.
+            _state.gpu_texture = None
             print(f"[Splatbus] updated color image: {img}, size={img.size if img else None}")
             print(f"[Splatbus] color shape: {color.shape}, dtype: {color.dtype}")
             print(f"[Splatbus] RGB mean: {color[..., :3].mean():.4f}, alpha mean: {alpha_mask.mean() if alpha_mask is not None else -1:.4f}")
@@ -531,6 +545,9 @@ def _on_render_complete(_scene=None):
     # Keep is_rendering=True for a 2-second cooldown after render finishes.
     # This prevents GPU touch while the render window is being opened/closed.
     _state.render_end_time = time.time()
+    # Drop the cached GPU texture; the viewport draw handler will rebuild it
+    # safely once a valid draw context exists again.
+    _state.gpu_texture = None
 
 
 # ===================== COMPOSITOR =====================
@@ -569,9 +586,8 @@ def _setup_compositor():
             "SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True
         )
         img_color.use_fake_user = True
-        if bpy.context.window is not None:
-            img_color.gl_touch()
-
+        # Image datablock changed; the cached GPU texture is no longer valid.
+        _state.gpu_texture = None
     # ── Splatbus depth image ──
     img_depth = bpy.data.images.get("SplatbusDepth")
     if img_depth is None or img_depth.size[0] != w or img_depth.size[1] != h:
@@ -587,8 +603,6 @@ def _setup_compositor():
                 img_depth.colorspace_settings.name = "Non-Color"
             except Exception:
                 pass
-        if bpy.context.window is not None:
-            img_depth.gl_touch()
 
     print(f"[Splatbus] compositor images: color={img_color}, depth={img_depth}, color.size={img_color.size[:]}, depth.size={img_depth.size[:]}")
 
@@ -736,8 +750,7 @@ class SplatbusConnectOperator(bpy.types.Operator):
                 "SplatbusOutput", width=sv_w, height=sv_h, alpha=True, float_buffer=True
             )
             img.use_fake_user = True
-            if bpy.context.window is not None:
-                img.gl_touch()
+            _state.gpu_texture = None
 
         t, quat = _state.client.get_camera_pose(cam_idx=0)
         print(f"[Splatbus] Server initial pose — t: {t}, quat: {quat}")
