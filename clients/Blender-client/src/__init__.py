@@ -8,13 +8,13 @@ bl_info = {
 }
 
 import os
+import socket
 import subprocess
 import sys
 import traceback
 from typing import Optional
 
 import bpy
-import gpu
 import numpy as np
 from bpy.props import (
     BoolProperty,
@@ -22,9 +22,10 @@ from bpy.props import (
     StringProperty,
     PointerProperty,
 )
-from gpu.types import GPUTexture
-from gpu_extras.batch import batch_for_shader
 from mathutils import Matrix, Vector
+
+import gpu
+from gpu_extras.batch import batch_for_shader
 
 try:
     import torch
@@ -59,13 +60,11 @@ class _SplatbusState:
     width: int = 0
     height: int = 0
 
-    color_buffer_np: Optional[np.ndarray] = None
-    gpu_texture: Optional[GPUTexture] = None
-
-    draw_handler: Optional[object] = None
     timer: Optional[object] = None
     is_running: bool = False
     compositor_ready: bool = False
+    gpu_texture: Optional[object] = None
+    draw_handler: Optional[object] = None
 
 _state = _SplatbusState()
 
@@ -98,100 +97,6 @@ class SplatbusProperties(bpy.types.PropertyGroup):
 # ===================== CAMERA MATH =====================
 
 
-def get_sensor_size(sensor_fit, sensor_x, sensor_y):
-    if sensor_fit == "VERTICAL":
-        return sensor_y
-    return sensor_x
-
-
-def get_sensor_fit(sensor_fit, size_x, size_y):
-    if sensor_fit == "AUTO":
-        if size_x >= size_y:
-            return "HORIZONTAL"
-        else:
-            return "VERTICAL"
-    return sensor_fit
-
-
-def get_calibration_matrix_K_from_blender(camd):
-    assert isinstance(camd, bpy.types.Camera)
-    if camd.type != "PERSP":
-        raise ValueError("Non-perspective cameras not supported")
-    scene = bpy.context.scene
-    f_in_mm = camd.lens
-    scale = scene.render.resolution_percentage / 100
-    resolution_x_in_px = scale * scene.render.resolution_x
-    resolution_y_in_px = scale * scene.render.resolution_y
-    sensor_size_in_mm = get_sensor_size(
-        camd.sensor_fit, camd.sensor_width, camd.sensor_height
-    )
-    sensor_fit = get_sensor_fit(
-        camd.sensor_fit,
-        scene.render.pixel_aspect_x * resolution_x_in_px,
-        scene.render.pixel_aspect_y * resolution_y_in_px,
-    )
-    pixel_aspect_ratio = scene.render.pixel_aspect_y / scene.render.pixel_aspect_x
-    if sensor_fit == "HORIZONTAL":
-        view_fac_in_px = resolution_x_in_px
-    else:
-        view_fac_in_px = pixel_aspect_ratio * resolution_y_in_px
-    pixel_size_mm_per_px = sensor_size_in_mm / f_in_mm / view_fac_in_px
-    s_u = 1 / pixel_size_mm_per_px
-    s_v = 1 / pixel_size_mm_per_px / pixel_aspect_ratio
-
-    u_0 = resolution_x_in_px / 2 - camd.shift_x * view_fac_in_px
-    v_0 = resolution_y_in_px / 2 + camd.shift_y * view_fac_in_px / pixel_aspect_ratio
-    skew = 0
-
-    K = Matrix(((s_u, skew, u_0), (0, s_v, v_0), (0, 0, 1)))
-    return K, {
-        "width": resolution_x_in_px * scale,
-        "height": resolution_y_in_px * scale,
-        "focal_len": f_in_mm,
-    }
-
-
-def get_3x4_RT_matrix_from_blender(cam, to_cv: bool):
-    R_bcam2cv = Matrix(
-        (
-            (1, 0, 0),
-            (0, -1, 0),
-            (0, 0, -1),
-        )
-    )
-
-    location, rotation = cam.matrix_world.decompose()[0:2]
-    R_world2bcam = rotation.to_matrix().transposed()
-    T_world2bcam = -1 * R_world2bcam @ location
-
-    R_world2cv = R_bcam2cv @ R_world2bcam
-    T_world2cv = R_bcam2cv @ T_world2bcam
-
-    cvRT = Matrix(
-        (
-            R_world2cv[0][:] + (T_world2cv[0],),
-            R_world2cv[1][:] + (T_world2cv[1],),
-            R_world2cv[2][:] + (T_world2cv[2],),
-        )
-    )
-    glRT = Matrix(
-        (
-            R_world2bcam[0][:] + (T_world2bcam[0],),
-            R_world2bcam[1][:] + (T_world2bcam[1],),
-            R_world2bcam[2][:] + (T_world2bcam[2],),
-        )
-    )
-
-    return cvRT if to_cv else glRT
-
-
-def get_3x4_P_matrix_from_blender(cam, to_cv: bool):
-    assert isinstance(cam, bpy.types.Object)
-    K, intrinsics = get_calibration_matrix_K_from_blender(cam.data)
-    RT = get_3x4_RT_matrix_from_blender(cam, to_cv)
-    return K @ RT, K, intrinsics, RT
-
-
 def get_blender_camera_resolution(scene):
     scale = scene.render.resolution_percentage / 100.0
     w = int(scene.render.resolution_x * scale)
@@ -202,30 +107,77 @@ def get_blender_camera_resolution(scene):
 # ===================== CORE IPC FUNCTIONS =====================
 
 
-def _send_pose():
-    if _state.client is None or not _state.client.connected:
-        return False
-    scene = bpy.context.scene
-    cam = scene.camera
-    if cam is None:
-        return False
+# Blender camera -> OpenCV camera coordinate conversion.
+_R_BCAM2CV = np.array(
+    [
+        [1, 0, 0, 0],
+        [0, -1, 0, 0],
+        [0, 0, -1, 0],
+        [0, 0, 0, 1],
+    ],
+    dtype=np.float64,
+)
 
-    cvRT = get_3x4_RT_matrix_from_blender(cam, to_cv=True)
-    R = np.array([[cvRT[r][c] for c in range(3)] for r in range(3)])
-    t = np.array([cvRT[r][3] for r in range(3)])
 
-    bottom = np.array([[0.0, 0.0, 0.0, 1.0]])
-    RT4 = np.concatenate([np.column_stack([R, t]), bottom], axis=0)
-    c2w = np.linalg.inv(RT4)
+def _matrix_to_pose(c2w: np.ndarray):
+    """Extract position and xyzw quaternion from a camera-to-world matrix."""
     position = c2w[:3, 3]
     rot = Matrix(c2w[:3, :3].tolist())
     q = rot.to_quaternion()
-    q_xyzw = np.array([q.x, q.y, q.z, q.w])
-
-    _state.client.send_camera_pose(
-        position={k: str(v) for k, v in zip("xyz", position)},
-        rotation={k: str(v) for k, v in zip("xyzw", q_xyzw)},
+    return (
+        {k: str(v) for k, v in zip("xyz", position)},
+        {k: str(v) for k, v in zip("xyzw", np.array([q.x, q.y, q.z, q.w]))},
     )
+
+
+def _get_active_viewport_rv3d():
+    """Return the active RegionView3D or None."""
+    screen = bpy.context.screen
+    if screen is None:
+        return None
+    active = bpy.context.area
+    if active and active.type == 'VIEW_3D':
+        for space in active.spaces:
+            if space.type == 'VIEW_3D':
+                return space.region_3d
+    for area in screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    return space.region_3d
+    return None
+
+
+def _get_viewport_camera_matrix():
+    """Return the active 3D viewport's camera-to-world matrix (OpenCV convention)."""
+    rv3d = _get_active_viewport_rv3d()
+    if rv3d is None:
+        return None
+    bcam_view = np.array(rv3d.view_matrix)
+    cv_view = _R_BCAM2CV @ bcam_view
+    return np.linalg.inv(cv_view)
+
+
+def _get_scene_camera_matrix():
+    """Return the scene camera's camera-to-world matrix (OpenCV convention)."""
+    cam = bpy.context.scene.camera
+    if cam is None:
+        return None
+    bcam_view = np.array(cam.matrix_world.inverted())
+    cv_view = _R_BCAM2CV @ bcam_view
+    return np.linalg.inv(cv_view)
+
+
+def _send_pose(c2w=None):
+    if _state.client is None or not _state.client.connected:
+        return False
+    if c2w is None:
+        c2w = _get_scene_camera_matrix()
+    if c2w is None:
+        return False
+
+    position, rotation = _matrix_to_pose(c2w)
+    _state.client.send_camera_pose(position=position, rotation=rotation)
     return True
 
 
@@ -243,18 +195,50 @@ def _receive_frame() -> Optional[np.ndarray]:
     return arr
 
 
-def _update_display_texture(color_np: np.ndarray):
-    if color_np is None or color_np.size == 0:
+def _safe_close_client(client):
+    """Close the client without calling CUDA driver cleanup routines.
+
+    Calling ``client.close()`` inside Blender can segfault in ``cuEventDestroy``
+    because the CUDA IPC event was opened in a context that conflicts with
+    Blender's own CUDA use.  We close the sockets and drop our Python references
+    to the shared buffers; the OS/CUDA runtime reclaims the IPC handles when
+    Blender exits.
+    """
+    if client is None:
         return
-    h, w = color_np.shape[:2]
-    _state.width, _state.height = w, h
-    _state.color_buffer_np = (np.clip(color_np[..., :3], 0, 1) * 255).astype(np.uint8)
+    try:
+        client.connected = False
+        client.stop_event.set()
+
+        # Release torch tensors held by the buffers without invoking the buffer
+        # ``close()`` methods that call cudaStreamDestroy / cudaIpcCloseMemHandle /
+        # cudaEventDestroy.
+        for buf in (client.client_buffer_color, client.client_buffer_depth, client.client_buffer_evt):
+            if buf is not None:
+                buf.read_buffer = None
+
+        # Close sockets only.
+        for sock_name in ("ipc_sock", "msg_sock"):
+            sock = getattr(client, sock_name, None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                setattr(client, sock_name, None)
+    except Exception:
+        traceback.print_exc()
 
 
 def _update_compositor_image(color_np: np.ndarray):
     if color_np is None or color_np.size == 0:
         return
     h, w = color_np.shape[:2]
+    _state.width, _state.height = w, h
     img = bpy.data.images.get("SplatbusOutput")
     if img is None or img.size[0] != w or img.size[1] != h:
         if img is not None:
@@ -267,6 +251,10 @@ def _update_compositor_image(color_np: np.ndarray):
     flat[3::4] = 1.0
     img.pixels.foreach_set(flat)
     img.update()
+    img.gl_touch()
+
+    tex = gpu.texture.from_image(img)
+    _state.gpu_texture = tex
 
 
 # ===================== TICK =====================
@@ -280,10 +268,10 @@ def _tick():
         return None
 
     try:
-        _send_pose()
+        c2w = _get_viewport_camera_matrix()
+        _send_pose(c2w)
         color = _receive_frame()
         if color is not None:
-            _update_display_texture(color)
             _update_compositor_image(color)
     except Exception:
         traceback.print_exc()
@@ -295,24 +283,24 @@ def _tick():
 
 
 def _draw_viewport():
-    img = bpy.data.images.get("SplatbusOutput")
-    if img is None:
+    tex = _state.gpu_texture
+    if tex is None:
         return
-    tex = gpu.texture.from_image(img)
     region = bpy.context.region
     if region is None:
         return
-    w, h = region.width, region.height
+    vw, vh = region.width, region.height
 
     shader = gpu.shader.from_builtin("IMAGE")
     shader.bind()
     shader.uniform_sampler("image", tex)
 
-    gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.depth_mask_set(False)
     with gpu.matrix.push_pop_projection():
         proj = Matrix((
-            (2 / w, 0, 0, -1),
-            (0, 2 / h, 0, -1),
+            (2 / vw, 0, 0, -1),
+            (0, 2 / vh, 0, -1),
             (0, 0, -1, 0),
             (0, 0, 0, 1),
         ))
@@ -321,12 +309,13 @@ def _draw_viewport():
         batch = batch_for_shader(
             shader, "TRI_FAN",
             {
-                "pos": ((0, 0), (w, 0), (w, h), (0, h)),
+                "pos": ((0, 0, -1), (vw, 0, -1), (vw, vh, -1), (0, vh, -1)),
                 "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1)),
             },
         )
         batch.draw(shader)
-    gpu.state.blend_set("NONE")
+    gpu.state.depth_test_set('LESS')
+    gpu.state.depth_mask_set(True)
 
 
 # ===================== LIFECYCLE =====================
@@ -339,11 +328,6 @@ def _start():
 
     _state.timer = bpy.app.timers.register(_tick, first_interval=0.0, persistent=True)
 
-    if _state.draw_handler is None:
-        _state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
-            _draw_viewport, (), "WINDOW", "POST_PIXEL"
-        )
-
     if not _state.compositor_ready:
         _setup_compositor()
         _state.compositor_ready = True
@@ -351,6 +335,11 @@ def _start():
     for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_pre):
         if _on_frame_change not in h:
             h.append(_on_frame_change)
+
+    if _state.draw_handler is None:
+        _state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_viewport, (), 'WINDOW', 'POST_VIEW'
+        )
 
 
 def _stop():
@@ -365,10 +354,12 @@ def _stop():
 
     if _state.draw_handler is not None:
         try:
-            bpy.types.SpaceView3D.draw_handler_remove(_state.draw_handler, "WINDOW")
-        except (ValueError, RuntimeError):
+            bpy.types.SpaceView3D.draw_handler_remove(_state.draw_handler, 'WINDOW')
+        except (ValueError, TypeError):
             pass
         _state.draw_handler = None
+
+    _state.gpu_texture = None
 
     for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_pre):
         try:
@@ -376,14 +367,13 @@ def _stop():
         except ValueError:
             pass
 
-    _state.gpu_texture = None
-
 
 def _on_frame_change(_scene=None, _depsgraph=None):
     if not _state.is_running:
         return
     try:
-        _send_pose()
+        c2w = _get_scene_camera_matrix()
+        _send_pose(c2w)
         color = _receive_frame()
         if color is not None:
             _update_compositor_image(color)
@@ -486,10 +476,8 @@ class SplatbusDisconnectOperator(bpy.types.Operator):
     def execute(self, context):
         _stop()
         if _state.client is not None:
-            _state.client.close()
+            _safe_close_client(_state.client)
             _state.client = None
-        _state.color_buffer_np = None
-        _state.gpu_texture = None
         self.report({"INFO"}, "Disconnected from SplatBus")
         return {"FINISHED"}
 
@@ -540,6 +528,7 @@ class SplatbusInstallTorchOperator(bpy.types.Operator):
 
         blender_python = sys.executable
         uv_path = _find_uv()
+        # TODO: automatic versioning
         idx_url = "https://download.pytorch.org/whl/cu124"
 
         if uv_path:
@@ -664,7 +653,7 @@ def register():
 def unregister():
     _stop()
     if _state.client is not None:
-        _state.client.close()
+        _safe_close_client(_state.client)
         _state.client = None
 
     bpy.app.handlers.load_post.remove(_load_handler)
