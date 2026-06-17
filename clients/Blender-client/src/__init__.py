@@ -7,10 +7,12 @@ bl_info = {
     "description": "Gaussian Splating unified rendering interface",
 }
 
+import atexit
 import os
 import socket
 import subprocess
 import sys
+import time
 import traceback
 from typing import Optional
 
@@ -22,7 +24,7 @@ from bpy.props import (
     StringProperty,
     PointerProperty,
 )
-from mathutils import Matrix, Vector
+from mathutils import Matrix, Vector, Quaternion
 
 import gpu
 from gpu_extras.batch import batch_for_shader
@@ -65,6 +67,9 @@ class _SplatbusState:
     compositor_ready: bool = False
     gpu_texture: Optional[object] = None
     draw_handler: Optional[object] = None
+    canonical_c2w: Optional[np.ndarray] = None
+    is_rendering: bool = False
+    render_end_time: float = 0.0
 
 _state = _SplatbusState()
 
@@ -168,6 +173,31 @@ def _get_scene_camera_matrix():
     return np.linalg.inv(cv_view)
 
 
+def _colmap_pose_to_blender_c2w(t, quat_xyzw):
+    """Convert a server COLMAP camera pose to a Blender/OpenGL c2w matrix."""
+    x, y, z, w = quat_xyzw
+    q = Quaternion((w, x, y, z))
+    c2w_colmap = np.eye(4, dtype=np.float64)
+    c2w_colmap[:3, :3] = np.array(q.to_matrix())
+    c2w_colmap[:3, 3] = np.array(t).reshape(3)
+    # Blender/OpenGL camera convention differs from COLMAP by a Y/Z flip.
+    return c2w_colmap @ _R_BCAM2CV
+
+
+def _apply_server_canonical_pose(t, quat_xyzw):
+    """Set the scene camera to the server's canonical/test camera pose."""
+    scene = bpy.context.scene
+    cam_obj = scene.camera
+    if cam_obj is None:
+        cam_data = bpy.data.cameras.new(name="SplatBusCamera")
+        cam_obj = bpy.data.objects.new(name="SplatBusCamera", object_data=cam_data)
+        scene.collection.objects.link(cam_obj)
+        scene.camera = cam_obj
+    c2w_blender = _colmap_pose_to_blender_c2w(t, quat_xyzw)
+    cam_obj.matrix_world = Matrix(c2w_blender.tolist())
+    _state.canonical_c2w = c2w_blender.copy()
+
+
 def _send_pose(c2w=None):
     if _state.client is None or not _state.client.connected:
         return False
@@ -234,9 +264,13 @@ def _safe_close_client(client):
         traceback.print_exc()
 
 
-def _update_compositor_image(color_np: np.ndarray):
+def _update_blender_image(color_np: np.ndarray, touch_gpu: bool = False):
+    """Update the SplatbusOutput image pixels from a numpy RGB frame."""
     if color_np is None or color_np.size == 0:
-        return
+        return None
+    # ClientBuffer flips the server image to top-down (CV2) order; Blender's
+    # Image.pixels / gpu textures expect bottom-up (OpenGL) order.
+    color_np = np.flipud(color_np)
     h, w = color_np.shape[:2]
     _state.width, _state.height = w, h
     img = bpy.data.images.get("SplatbusOutput")
@@ -244,6 +278,7 @@ def _update_compositor_image(color_np: np.ndarray):
         if img is not None:
             bpy.data.images.remove(img)
         img = bpy.data.images.new("SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True)
+        img.use_fake_user = True
     flat = np.empty(w * h * 4, dtype=np.float32)
     flat[0::4] = color_np[..., 0].ravel()
     flat[1::4] = color_np[..., 1].ravel()
@@ -251,8 +286,17 @@ def _update_compositor_image(color_np: np.ndarray):
     flat[3::4] = 1.0
     img.pixels.foreach_set(flat)
     img.update()
-    img.gl_touch()
+    img.update_tag()
+    if touch_gpu:
+        img.gl_touch()
+    return img
 
+
+def _update_compositor_image(color_np: np.ndarray):
+    """Update the compositor image and the viewport GPU texture."""
+    img = _update_blender_image(color_np, touch_gpu=True)
+    if img is None:
+        return
     tex = gpu.texture.from_image(img)
     _state.gpu_texture = tex
 
@@ -266,13 +310,30 @@ def _tick():
     if _state.client is None or not _state.client.connected:
         _stop()
         return None
+    # Avoid touching GPU resources when Blender is shutting down or the active
+    # window/context has gone away.
+    if bpy.context.window is None or bpy.context.screen is None:
+        _stop()
+        return None
+
+    # After a render finishes, keep GPU operations paused for a 2 s cooldown
+    # so closing the render window doesn't crash Blender.
+    if _state.is_rendering and _state.render_end_time > 0:
+        if time.time() - _state.render_end_time > 2.0:
+            _state.is_rendering = False
+            _state.render_end_time = 0.0
 
     try:
         c2w = _get_viewport_camera_matrix()
         _send_pose(c2w)
         color = _receive_frame()
         if color is not None:
-            _update_compositor_image(color)
+            if _state.is_rendering:
+                # Skip GPU texture creation while a render is in progress to
+                # avoid touching the GL context at a bad time.
+                _update_blender_image(color)
+            else:
+                _update_compositor_image(color)
     except Exception:
         traceback.print_exc()
 
@@ -332,9 +393,11 @@ def _start():
         _setup_compositor()
         _state.compositor_ready = True
 
-    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_pre):
+    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_init):
         if _on_frame_change not in h:
             h.append(_on_frame_change)
+    if _on_render_complete not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(_on_render_complete)
 
     if _state.draw_handler is None:
         _state.draw_handler = bpy.types.SpaceView3D.draw_handler_add(
@@ -360,25 +423,42 @@ def _stop():
         _state.draw_handler = None
 
     _state.gpu_texture = None
+    _state.canonical_c2w = None
 
-    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_pre):
+    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_init):
         try:
             h.remove(_on_frame_change)
         except ValueError:
             pass
+    try:
+        bpy.app.handlers.render_complete.remove(_on_render_complete)
+    except ValueError:
+        pass
 
 
 def _on_frame_change(_scene=None, _depsgraph=None):
     if not _state.is_running:
         return
+    _state.is_rendering = True
     try:
+        print(f"[Splatbus] render/frame handler fired")
         c2w = _get_scene_camera_matrix()
         _send_pose(c2w)
         color = _receive_frame()
+        print(f"[Splatbus] received frame: {color is not None}, shape={color.shape if color is not None else None}")
         if color is not None:
-            _update_compositor_image(color)
+            # During render there is no active GPU context; only update the
+            # Blender image pixels, not the viewport texture.
+            img = _update_blender_image(color)
+            print(f"[Splatbus] updated image: {img}, size={img.size if img else None}, mean={color.mean():.4f}")
     except Exception:
         traceback.print_exc()
+
+
+def _on_render_complete(_scene=None):
+    # Keep is_rendering=True for a 2-second cooldown after render finishes.
+    # This prevents GPU touch while the render window is being opened/closed.
+    _state.render_end_time = time.time()
 
 
 # ===================== COMPOSITOR =====================
@@ -387,33 +467,47 @@ def _on_frame_change(_scene=None, _depsgraph=None):
 def _setup_compositor():
     scene = bpy.context.scene
     scene.use_nodes = True
+    # Make the render background transparent so the Splatbus image shows through
+    # wherever there is no Blender geometry.
+    scene.render.film_transparent = True
     tree = scene.node_tree
     if tree is None:
         return
 
-    if any(n.type == "IMAGE" and n.image and n.image.name == "SplatbusOutput" for n in tree.nodes):
-        return
+    # Remove all existing compositor nodes so repeated clicks always give a
+    # clean Splatbus setup.
+    for n in list(tree.nodes):
+        tree.nodes.remove(n)
 
     w, h = _state.width or 1920, _state.height or 1080
     img = bpy.data.images.get("SplatbusOutput")
-    if img is None:
+    if img is None or img.size[0] != w or img.size[1] != h:
+        if img is not None:
+            bpy.data.images.remove(img)
         img = bpy.data.images.new("SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True)
+        img.use_fake_user = True
+        # Ensure the image has a GPU-side representation so the compositor can
+        # read it even if no viewport frame has been rendered yet.
+        if bpy.context.window is not None:
+            img.gl_touch()
 
     rl = tree.nodes.new("CompositorNodeRLayers")
-    rl.location = (0, 0)
+    rl.location = (-400, 0)
 
     img_node = tree.nodes.new("CompositorNodeImage")
-    img_node.location = (0, 200)
+    img_node.location = (-400, 250)
     img_node.image = img
 
     alpha_over = tree.nodes.new("CompositorNodeAlphaOver")
-    alpha_over.location = (400, 0)
+    alpha_over.location = (0, 0)
 
     composite = tree.nodes.new("CompositorNodeComposite")
-    composite.location = (600, 0)
+    composite.location = (300, 0)
 
-    tree.links.new(img_node.outputs["Image"], alpha_over.inputs[2])
-    tree.links.new(rl.outputs["Image"], alpha_over.inputs[1])
+    # AlphaOver composites foreground over background.
+    # In this build: input 1 = background, input 2 = foreground.
+    tree.links.new(img_node.outputs["Image"], alpha_over.inputs[1])
+    tree.links.new(rl.outputs["Image"], alpha_over.inputs[2])
     tree.links.new(alpha_over.outputs["Image"], composite.inputs["Image"])
 
 
@@ -458,10 +552,27 @@ class SplatbusConnectOperator(bpy.types.Operator):
             return {"CANCELLED"}
 
         scene = context.scene
-        _state.width, _state.height = get_blender_camera_resolution(scene)
+        # Use the server's fixed rendering resolution for the shared image so the
+        # compositor image does not get recreated (and lose its GPU texture) on
+        # the first render.
+        sv_w, sv_h = _state.client.get_viewport_size()
+        if sv_w <= 0 or sv_h <= 0:
+            sv_w, sv_h = get_blender_camera_resolution(scene)
+        _state.width, _state.height = sv_w, sv_h
+        img = bpy.data.images.get("SplatbusOutput")
+        if img is None or img.size[0] != sv_w or img.size[1] != sv_h:
+            if img is not None:
+                bpy.data.images.remove(img)
+            img = bpy.data.images.new(
+                "SplatbusOutput", width=sv_w, height=sv_h, alpha=True, float_buffer=True
+            )
+            img.use_fake_user = True
+            if bpy.context.window is not None:
+                img.gl_touch()
 
         t, quat = _state.client.get_camera_pose(cam_idx=0)
         print(f"[Splatbus] Server initial pose — t: {t}, quat: {quat}")
+        _apply_server_canonical_pose(t, quat)
 
         _start()
         self.report({"INFO"}, "Connected to SplatBus")
@@ -643,20 +754,33 @@ def _load_handler(_dummy):
     pass  # placeholder for future reload-state logic
 
 
-def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
-    bpy.types.Scene.splatbus_setup = PointerProperty(type=SplatbusProperties)
-    bpy.app.handlers.load_post.append(_load_handler)
-
-
-def unregister():
+@bpy.app.handlers.persistent
+def _shutdown_handler(_dummy=None):
+    """Stop the render loop before file load or Blender shutdown."""
     _stop()
     if _state.client is not None:
         _safe_close_client(_state.client)
         _state.client = None
 
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.splatbus_setup = PointerProperty(type=SplatbusProperties)
+    bpy.app.handlers.load_post.append(_load_handler)
+    bpy.app.handlers.load_pre.append(_shutdown_handler)
+    atexit.register(_shutdown_handler)
+
+
+def unregister():
+    _shutdown_handler()
+    atexit.unregister(_shutdown_handler)
+
     bpy.app.handlers.load_post.remove(_load_handler)
+    try:
+        bpy.app.handlers.load_pre.remove(_shutdown_handler)
+    except ValueError:
+        pass
 
     del bpy.types.Scene.splatbus_setup
     for cls in reversed(classes):
