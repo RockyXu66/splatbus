@@ -71,6 +71,11 @@ class _SplatbusState:
     is_rendering: bool = False
     render_end_time: float = 0.0
     point_cloud_object: Optional[object] = None
+    original_resolution_x: int = 0
+    original_resolution_y: int = 0
+    original_resolution_percentage: int = 100
+    last_camera_position: Optional[np.ndarray] = None
+    last_camera_rotation: Optional[np.ndarray] = None
 
 _state = _SplatbusState()
 
@@ -417,22 +422,39 @@ def _tick():
 
     try:
         c2w = _get_viewport_camera_matrix()
-        _send_pose(c2w)
-        frames = _receive_frames()
-        if frames:
-            color = frames.get("color")
-            depth = frames.get("depth")
-            if color is not None:
-                if _state.is_rendering:
-                    _update_blender_image(color, alpha_mask=(depth < 99.9).astype(np.float32) if depth is not None else None)
-                else:
-                    _update_compositor_image(color, depth)
-            if depth is not None:
-                _update_depth_image(depth)
+
+        # Skip server updates when the viewport camera has not moved.  This
+        # eliminates jitter caused by re-uploading identical/oscillating frames
+        # every tick when the view is static.
+        pos = c2w[:3, 3]
+        rot = c2w[:3, :3]
+        last_pos = _state.last_camera_position
+        last_rot = _state.last_camera_rotation
+        camera_changed = True
+        if last_pos is not None and last_rot is not None:
+            pos_delta = np.linalg.norm(pos - last_pos)
+            rot_delta = np.linalg.norm(rot - last_rot)
+            if pos_delta < 1e-4 and rot_delta < 1e-4:
+                camera_changed = False
+        if camera_changed:
+            _state.last_camera_position = pos.copy()
+            _state.last_camera_rotation = rot.copy()
+            _send_pose(c2w)
+            frames = _receive_frames()
+            if frames:
+                color = frames.get("color")
+                depth = frames.get("depth")
+                if color is not None:
+                    if _state.is_rendering:
+                        _update_blender_image(color, alpha_mask=(depth < 99.9).astype(np.float32) if depth is not None else None)
+                    else:
+                        _update_compositor_image(color, depth)
+                if depth is not None:
+                    _update_depth_image(depth)
     except Exception:
         traceback.print_exc()
 
-    return 1.0 / 30.0
+    return 1.0 / 60.0
 
 
 # ===================== VIEWPORT DRAW =====================
@@ -535,6 +557,20 @@ def _stop():
     _state.gpu_texture = None
     _state.canonical_c2w = None
     _state.point_cloud_object = None
+
+    # Restore the render resolution we changed on connect.
+    try:
+        scene = bpy.context.scene
+        if _state.original_resolution_x > 0:
+            scene.render.resolution_x = _state.original_resolution_x
+            scene.render.resolution_y = _state.original_resolution_y
+            scene.render.resolution_percentage = _state.original_resolution_percentage
+            _state.original_resolution_x = 0
+            _state.original_resolution_y = 0
+            _state.original_resolution_percentage = 100
+            print("[Splatbus] restored original render resolution")
+    except Exception:
+        pass
 
     for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_init):
         try:
@@ -791,17 +827,23 @@ def _setup_compositor():
     tree.links.new(sep_depth.outputs["R"], empty_mask.inputs[0])
 
     # Depth comparison: splatbus depth < Blender Z-pass → 1.0, else 0.0
+    # Use a Map Range to soften the edge over a small world-unit band, which
+    # anti-aliases the boundary between Blender geometry and splats.
     depth_diff = tree.nodes.new("CompositorNodeMath")
     depth_diff.operation = "SUBTRACT"
     depth_diff.location = (-500, 500)
-    tree.links.new(sep_depth.outputs["R"], depth_diff.inputs[0])
-    tree.links.new(rl.outputs["Depth"], depth_diff.inputs[1])
+    tree.links.new(rl.outputs["Depth"], depth_diff.inputs[0])
+    tree.links.new(sep_depth.outputs["R"], depth_diff.inputs[1])
 
-    depth_mask_lt = tree.nodes.new("CompositorNodeMath")
-    depth_mask_lt.operation = "LESS_THAN"
-    depth_mask_lt.inputs[1].default_value = 0.0
-    depth_mask_lt.location = (-300, 500)
-    tree.links.new(depth_diff.outputs[0], depth_mask_lt.inputs[0])
+    depth_soft = tree.nodes.new("CompositorNodeMapRange")
+    depth_soft.location = (-300, 500)
+    # Widen the soft depth band to further anti-alias occlusion boundaries.
+    depth_soft.inputs["From Min"].default_value = -0.02
+    depth_soft.inputs["From Max"].default_value = 0.02
+    depth_soft.inputs["To Min"].default_value = 0.0
+    depth_soft.inputs["To Max"].default_value = 1.0
+    depth_soft.use_clamp = True
+    tree.links.new(depth_diff.outputs[0], depth_soft.inputs["Value"])
 
     # Background mask: Blender render alpha == 0 → 1.0, else 0.0
     bg_mask = tree.nodes.new("CompositorNodeMath")
@@ -814,7 +856,7 @@ def _setup_compositor():
     depth_mask = tree.nodes.new("CompositorNodeMath")
     depth_mask.operation = "MAXIMUM"
     depth_mask.location = (-100, 500)
-    tree.links.new(depth_mask_lt.outputs[0], depth_mask.inputs[0])
+    tree.links.new(depth_soft.outputs["Value"], depth_mask.inputs[0])
     tree.links.new(bg_mask.outputs[0], depth_mask.inputs[1])
 
     # Final mask = depth_mask * empty_mask
@@ -824,19 +866,28 @@ def _setup_compositor():
     tree.links.new(depth_mask.outputs[0], final_mask.inputs[0])
     tree.links.new(empty_mask.outputs[0], final_mask.inputs[1])
 
+    # Slightly blur the mask to anti-alias the composite edge after Cycles/
+    # EEVEE have softened their own edges.
+    mask_blur = tree.nodes.new("CompositorNodeBlur")
+    mask_blur.location = (250, 600)
+    mask_blur.filter_type = 'GAUSS'
+    mask_blur.size_x = 2
+    mask_blur.size_y = 2
+    tree.links.new(final_mask.outputs[0], mask_blur.inputs["Image"])
+
     # Composite: show Splatbus where mask=1, Blender render where mask=0.
     # In Blender 4.x MixRGB, Fac=1 selects input 2 and Fac=0 selects input 1,
     # so Splatbus must be wired to input 2 and the render to input 1.
     mix = tree.nodes.new("CompositorNodeMixRGB")
-    mix.location = (300, 0)
+    mix.location = (450, 0)
     mix.blend_type = "MIX"
 
     composite = tree.nodes.new("CompositorNodeComposite")
-    composite.location = (600, 0)
+    composite.location = (750, 0)
 
     tree.links.new(rl.outputs["Image"], mix.inputs[1])
     tree.links.new(node_color.outputs["Image"], mix.inputs[2])
-    tree.links.new(final_mask.outputs[0], mix.inputs[0])
+    tree.links.new(mask_blur.outputs["Image"], mix.inputs[0])
     tree.links.new(mix.outputs["Image"], composite.inputs["Image"])
 
     # Force the node tree to refresh.
@@ -894,6 +945,17 @@ class SplatbusConnectOperator(bpy.types.Operator):
         if sv_w <= 0 or sv_h <= 0:
             sv_w, sv_h = get_blender_camera_resolution(scene)
         _state.width, _state.height = sv_w, sv_h
+
+        # Match Blender's render resolution to the server image so the compositor
+        # does not have to scale the Splatbus image (which causes aliasing).
+        _state.original_resolution_x = scene.render.resolution_x
+        _state.original_resolution_y = scene.render.resolution_y
+        _state.original_resolution_percentage = scene.render.resolution_percentage
+        scene.render.resolution_x = sv_w
+        scene.render.resolution_y = sv_h
+        scene.render.resolution_percentage = 100
+        print(f"[Splatbus] matched render resolution to {sv_w}x{sv_h}")
+
         img = bpy.data.images.get("SplatbusOutput")
         if img is None or img.size[0] != sv_w or img.size[1] != sv_h:
             if img is not None:
