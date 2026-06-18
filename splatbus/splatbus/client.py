@@ -216,6 +216,31 @@ class GaussianSplattingIPCClient:
             rotation = default_rotation
         return np.array(position), np.array(rotation)
 
+    def get_camera_info(self, cam_idx: int = 0) -> Optional[Tuple[float, float, int, int]]:
+        """
+        Request the server's camera intrinsics and image resolution.
+        Returns (fov_x, fov_y, width, height) or None on failure.
+        """
+        payload = {"type": "get_camera_info", "cam_idx": cam_idx}
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)
+        except Exception as e:
+            logger.warning(f"[IPCClient] get_camera_info request failed: {e}")
+            return None
+        if json_msg is None:
+            return None
+        try:
+            return (
+                float(json_msg.get("fov_x", 0.0)),
+                float(json_msg.get("fov_y", 0.0)),
+                int(json_msg.get("width", 0)),
+                int(json_msg.get("height", 0)),
+            )
+        except Exception as e:
+            logger.warning(f"[IPCClient] failed to decode camera info: {e}")
+            return None
+
     def get_gaussians(self) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
         """
         Request the 3D Gaussian positions and colors from the server.
@@ -250,17 +275,48 @@ class GaussianSplattingIPCClient:
             logger.warning(f"[IPCClient] failed to decode gaussians: {e}")
             return None
 
-    def send_camera_pose(self, position: Dict[str, float], rotation: Dict[str, float]):
+    def send_camera_pose(
+        self,
+        position: Dict[str, float],
+        rotation: Dict[str, float],
+        fov_x: float = None,
+        fov_y: float = None,
+        fl_x: float = None,
+        fl_y: float = None,
+        cx: float = None,
+        cy: float = None,
+        intr_width: int = None,
+        intr_height: int = None,
+    ):
         """
         Send camera pose
         position: {'x': float, 'y': float, 'z': float}
         rotation: {'x': float, 'y': float, 'z': float, 'w': float}
+        fov_x, fov_y: optional field-of-view (radians) to override the server default
+        fl_x, fl_y, cx, cy: optional pinhole intrinsics in pixels (COLMAP PINHOLE model)
+        intr_width, intr_height: resolution at which the intrinsics were computed
         """
         payload = {
             "type": "camera_pose",
             "position": position,
             "rotation": rotation,
         }
+        if fov_x is not None:
+            payload["fov_x"] = float(fov_x)
+        if fov_y is not None:
+            payload["fov_y"] = float(fov_y)
+        if fl_x is not None:
+            payload["fl_x"] = float(fl_x)
+        if fl_y is not None:
+            payload["fl_y"] = float(fl_y)
+        if cx is not None:
+            payload["cx"] = float(cx)
+        if cy is not None:
+            payload["cy"] = float(cy)
+        if intr_width is not None:
+            payload["intr_width"] = int(intr_width)
+        if intr_height is not None:
+            payload["intr_height"] = int(intr_height)
         self._send_json(self.msg_sock, payload)
 
     def send_point_cloud_pose(self, position: Dict[str, float], rotation: Dict[str, float]):

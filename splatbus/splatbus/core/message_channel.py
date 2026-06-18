@@ -1,4 +1,5 @@
 import base64
+import math
 import socket
 import warnings
 from typing import Dict, Optional, List
@@ -93,6 +94,45 @@ class MessageSocketServer(BaseSocketServer):
             world_to_camera = np.linalg.inv(camera_to_world)
             self._viewpoint.set_rt(R=world_to_camera[:3, :3].T, t=world_to_camera[:3, 3])
 
+            # Update intrinsics if the client provided them.  Prefer full
+            # pinhole intrinsics (fl_x/fl_y/cx/cy in pixels, COLMAP PINHOLE
+            # model) over plain FOV.
+            fl_x = cam_pose.get("fl_x")
+            fl_y = cam_pose.get("fl_y")
+            cx = cam_pose.get("cx")
+            cy = cam_pose.get("cy")
+            intr_w = cam_pose.get("intr_width")
+            intr_h = cam_pose.get("intr_height")
+            if fl_x is not None and fl_y is not None and cx is not None and cy is not None:
+                srv_w = self._viewpoint.image_width
+                srv_h = self._viewpoint.image_height
+                # Scale intrinsics from the client's resolution to the server's
+                # render resolution so the FOV and principal point are preserved.
+                if intr_w is not None and intr_h is not None and (intr_w != srv_w or intr_h != srv_h):
+                    sx = srv_w / float(intr_w)
+                    sy = srv_h / float(intr_h)
+                    fl_x = fl_x * sx
+                    fl_y = fl_y * sy
+                    cx = cx * sx
+                    cy = cy * sy
+                    logger.info(f"[Server] scaled intrinsics from {intr_w}x{intr_h} to {srv_w}x{srv_h}: fl_x={fl_x:.2f}, fl_y={fl_y:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+                else:
+                    logger.info(f"[Server] received intrinsics: fl_x={fl_x:.2f}, fl_y={fl_y:.2f}, cx={cx:.2f}, cy={cy:.2f}")
+                self._viewpoint.set_intrinsics(
+                    float(fl_x), float(fl_y), float(cx), float(cy),
+                    width=srv_w,
+                    height=srv_h,
+                )
+            else:
+                fov_x = cam_pose.get("fov_x")
+                fov_y = cam_pose.get("fov_y")
+                if fov_x is not None:
+                    if fov_y is None:
+                        w = self._viewpoint.image_width
+                        h = self._viewpoint.image_height
+                        fov_y = 2.0 * math.atan(math.tan(fov_x / 2.0) * (h / w))
+                    self._viewpoint.set_fov(float(fov_x), float(fov_y))
+
     def init_view(self, view: IPCCamera):
         if not isinstance(view, IPCCamera):
             raise TypeError("view must be an instance of IPCCamera")
@@ -170,6 +210,23 @@ class MessageSocketServer(BaseSocketServer):
                 t = np.array([0.0, 0.0, 0.0])
                 quat = np.array([0.0, 0.0, 0.0, 1.0])
             self.send_message({"position": t.tolist(), "rotation": quat.tolist()})
+        elif payload.get("type") == "get_camera_info":
+            cam_idx = payload.get("cam_idx", 0)
+            if self._cam_list is not None:
+                cam: IPCCamera = self._cam_list[cam_idx % len(self._cam_list)]
+                fov_x = float(cam.FoVx)
+                fov_y = float(cam.FoVy)
+                width = int(cam.image_width)
+                height = int(cam.image_height)
+            else:
+                fov_x = fov_y = 1.0
+                width = height = 0
+            self.send_message({
+                "fov_x": fov_x,
+                "fov_y": fov_y,
+                "width": width,
+                "height": height,
+            })
         elif payload.get("type") == "get_gaussians":
             if self.gaussians_xyz is None:
                 self.send_message({"count": 0, "positions": "", "colors": ""})

@@ -8,6 +8,7 @@ bl_info = {
 }
 
 import atexit
+import math
 import os
 import socket
 import subprocess
@@ -251,6 +252,37 @@ def _matrix_to_pose(c2w: np.ndarray):
     )
 
 
+def _get_active_viewport_space():
+    """Return the active 3D viewport SpaceView3D or None."""
+    screen = bpy.context.screen
+    if screen is None:
+        return None
+    active = bpy.context.area
+    if active and active.type == 'VIEW_3D':
+        for space in active.spaces:
+            if space.type == 'VIEW_3D':
+                return space
+    for area in screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    return space
+    return None
+
+
+def _get_active_viewport_region():
+    """Return the WINDOW region of the active 3D viewport, or None."""
+    screen = bpy.context.screen
+    if screen is None:
+        return None
+    for area in screen.areas:
+        if area.type == 'VIEW_3D':
+            for region in area.regions:
+                if region.type == 'WINDOW':
+                    return region
+    return None
+
+
 def _get_active_viewport_rv3d():
     """Return the active RegionView3D or None."""
     screen = bpy.context.screen
@@ -313,8 +345,159 @@ def _apply_server_canonical_pose(t, quat_xyzw):
     cam_obj.matrix_world = Matrix(c2w_blender.tolist())
     _state.canonical_c2w = c2w_blender.copy()
 
+# I copied the blender camera parameter extraction code (following 2 functions) from stack exchange:
+# https://blender.stackexchange.com/questions/38009/3x4-camera-matrix-from-blender-camera
+# BKE_camera_sensor_size
+def get_sensor_size(sensor_fit, sensor_x, sensor_y):
+    if sensor_fit == "VERTICAL":
+        return sensor_y
+    return sensor_x
 
-def _send_pose(c2w=None):
+
+# BKE_camera_sensor_fit
+def get_sensor_fit(sensor_fit, size_x, size_y):
+    if sensor_fit == "AUTO":
+        if size_x >= size_y:
+            return "HORIZONTAL"
+        else:
+            return "VERTICAL"
+    return sensor_fit
+
+
+# Build intrinsic camera parameters from Blender camera data
+# See notes on this in
+# blender.stackexchange.com/questions/15102/what-is-blenders-camera-projection-matrix-model
+# as well as
+# https://blender.stackexchange.com/a/120063/3581
+def get_calibration_matrix_K_from_blender(camd):
+    assert isinstance(camd, bpy.types.Camera)
+    if camd.type != "PERSP":
+        raise ValueError("Non-perspective cameras not supported")
+    scene = bpy.context.scene
+    f_in_mm = camd.lens
+    scale = scene.render.resolution_percentage / 100
+    resolution_x_in_px = scale * scene.render.resolution_x
+    resolution_y_in_px = scale * scene.render.resolution_y
+    sensor_size_in_mm = get_sensor_size(
+        camd.sensor_fit, camd.sensor_width, camd.sensor_height
+    )
+    sensor_fit = get_sensor_fit(
+        camd.sensor_fit,
+        scene.render.pixel_aspect_x * resolution_x_in_px,
+        scene.render.pixel_aspect_y * resolution_y_in_px,
+    )
+    pixel_aspect_ratio = scene.render.pixel_aspect_y / scene.render.pixel_aspect_x
+    if sensor_fit == "HORIZONTAL":
+        view_fac_in_px = resolution_x_in_px
+    else:
+        view_fac_in_px = pixel_aspect_ratio * resolution_y_in_px
+    pixel_size_mm_per_px = sensor_size_in_mm / f_in_mm / view_fac_in_px
+    s_u = 1 / pixel_size_mm_per_px
+    s_v = 1 / pixel_size_mm_per_px / pixel_aspect_ratio
+
+    # Parameters of intrinsic calibration matrix K
+    u_0 = resolution_x_in_px / 2 - camd.shift_x * view_fac_in_px
+    v_0 = resolution_y_in_px / 2 + camd.shift_y * view_fac_in_px / pixel_aspect_ratio
+    skew = 0  # only use rectangular pixels
+
+    K = Matrix(((s_u, skew, u_0), (0, s_v, v_0), (0, 0, 1)))
+    return K, {
+        "width": resolution_x_in_px * scale,
+        "height": resolution_y_in_px * scale,
+        "focal_len": f_in_mm,
+    }  # For a simple pinhole model without distortions
+
+
+def _fov_from_K(K, width, height):
+    """Compute (fov_x, fov_y) in radians from a calibration matrix K and resolution."""
+    fx = K[0][0]
+    fy = K[1][1]
+    fov_x = 2.0 * math.atan(width / (2.0 * fx))
+    fov_y = 2.0 * math.atan(height / (2.0 * fy))
+    return fov_x, fov_y
+
+
+def _compute_camera_intrinsics(camera_data=None, space=None, region=None):
+    """Compute pinhole intrinsics (fl_x, fl_y, cx, cy, w, h) from a Blender
+    camera or viewport space, using the proven K matrix code path.
+
+    Returns a dict with keys fl_x, fl_y, cx, cy, width, height (all in pixels),
+    or None on failure.
+    """
+    scene = bpy.context.scene
+    if camera_data is not None:
+        K, info = get_calibration_matrix_K_from_blender(camera_data)
+        return {
+            "fl_x": K[0][0],
+            "fl_y": K[1][1],
+            "cx": K[0][2],
+            "cy": K[1][2],
+            "width": info["width"],
+            "height": info["height"],
+        }
+    elif space is not None:
+        # The viewport uses the same pinhole model with a default 36mm sensor.
+        # Build a temporary Camera data block to reuse the proven K code path.
+        # Use the actual viewport region dimensions so the focal length in
+        # pixels matches what the viewport is actually displaying.
+        if region is not None:
+            vp_w = region.width
+            vp_h = region.height
+            # Temporarily set render resolution to the viewport region size so
+            # get_calibration_matrix_K_from_blender computes K at the right
+            # resolution.
+            orig_rx = scene.render.resolution_x
+            orig_ry = scene.render.resolution_y
+            orig_pct = scene.render.resolution_percentage
+            scene.render.resolution_x = vp_w
+            scene.render.resolution_y = vp_h
+            scene.render.resolution_percentage = 100
+        else:
+            vp_w = scene.render.resolution_x
+            vp_h = scene.render.resolution_y
+        tmp_cam = bpy.data.cameras.new("SplatbusTmpVP")
+        tmp_cam.lens = space.lens
+        tmp_cam.sensor_width = 36.0
+        tmp_cam.sensor_fit = 'HORIZONTAL'
+        try:
+            K, info = get_calibration_matrix_K_from_blender(tmp_cam)
+            return {
+                "fl_x": K[0][0],
+                "fl_y": K[1][1],
+                "cx": K[0][2],
+                "cy": K[1][2],
+                "width": info["width"],
+                "height": info["height"],
+            }
+        finally:
+            bpy.data.cameras.remove(tmp_cam)
+            if region is not None:
+                scene.render.resolution_x = orig_rx
+                scene.render.resolution_y = orig_ry
+                scene.render.resolution_percentage = orig_pct
+    return None
+
+
+def _compute_camera_fov(camera_data=None, space=None):
+    """Compute (fov_x, fov_y) in radians from a Blender camera or viewport space."""
+    intrinsics = _compute_camera_intrinsics(camera_data=camera_data, space=space)
+    if intrinsics is None:
+        return None
+    return _fov_from_K(
+        Matrix(((intrinsics["fl_x"], 0, intrinsics["cx"]),
+                (0, intrinsics["fl_y"], intrinsics["cy"]),
+                (0, 0, 1))),
+        intrinsics["width"],
+        intrinsics["height"],
+    )
+
+
+def _send_pose(c2w=None, intrinsics=None):
+    """Send camera pose and optional pinhole intrinsics to the server.
+
+    ``intrinsics`` is a dict with fl_x, fl_y, cx, cy, width, height (in pixels).
+    The server scales the intrinsics to its own render resolution.
+    """
     if _state.client is None or not _state.client.connected:
         return False
     if c2w is None:
@@ -323,7 +506,19 @@ def _send_pose(c2w=None):
         return False
 
     position, rotation = _matrix_to_pose(c2w)
-    _state.client.send_camera_pose(position=position, rotation=rotation)
+    kwargs = {}
+    if intrinsics is not None:
+        for key in ("fl_x", "fl_y", "cx", "cy"):
+            if intrinsics.get(key) is not None:
+                kwargs[key] = intrinsics[key]
+        # Send the resolution the intrinsics were computed at so the server
+        # can scale to its own render resolution.
+        if intrinsics.get("width") is not None:
+            kwargs["intr_width"] = int(intrinsics["width"])
+        if intrinsics.get("height") is not None:
+            kwargs["intr_height"] = int(intrinsics["height"])
+        print(f"[Splatbus] sending intrinsics: fl_x={intrinsics.get('fl_x'):.2f}, fl_y={intrinsics.get('fl_y'):.2f}, cx={intrinsics.get('cx'):.2f}, cy={intrinsics.get('cy'):.2f}, w={intrinsics.get('width')}, h={intrinsics.get('height')}")
+    _state.client.send_camera_pose(position=position, rotation=rotation, **kwargs)
     return True
 
 
@@ -485,9 +680,15 @@ def _tick():
     try:
         c2w = _get_viewport_camera_matrix()
 
-        # Skip server updates when the viewport camera has not moved.  This
-        # eliminates jitter caused by re-uploading identical/oscillating frames
-        # every tick when the view is static.
+        # Compute the viewport's intrinsics from its lens setting and actual
+        # region dimensions.
+        vp_space = _get_active_viewport_space()
+        vp_region = _get_active_viewport_region()
+        vp_intrinsics = _compute_camera_intrinsics(space=vp_space, region=vp_region)
+
+        # Skip server updates when the viewport camera has not moved and FOV
+        # is unchanged.  This eliminates jitter caused by re-uploading
+        # identical/oscillating frames every tick when the view is static.
         pos = c2w[:3, 3]
         rot = c2w[:3, :3]
         last_pos = _state.last_camera_position
@@ -501,7 +702,7 @@ def _tick():
         if camera_changed:
             _state.last_camera_position = pos.copy()
             _state.last_camera_rotation = rot.copy()
-            _send_pose(c2w)
+            _send_pose(c2w, intrinsics=vp_intrinsics)
             frames = _receive_frames()
             if frames:
                 color = frames.get("color")
@@ -655,11 +856,13 @@ def _stop():
 
 def _on_render_pre(_scene=None):
     """Hide viewport point cloud right before render evaluation starts."""
-    vp_obj = bpy.data.objects.get("SplatbusPointCloud")
-    if vp_obj is not None:
-        vp_obj["splatbus_was_hidden_render"] = vp_obj.hide_render
-        vp_obj.hide_render = True
-        print(f"[Splatbus] render_pre: hid viewport point cloud (was {vp_obj['splatbus_was_hidden_render']})")
+    try:
+        vp_obj = bpy.data.objects.get("SplatbusPointCloud")
+        if vp_obj is not None:
+            vp_obj["splatbus_was_hidden_render"] = vp_obj.hide_render
+            vp_obj.hide_render = True
+    except Exception:
+        pass
 
 
 def _on_frame_change(_scene=None, _depsgraph=None):
@@ -670,17 +873,18 @@ def _on_frame_change(_scene=None, _depsgraph=None):
         return
     _state.is_rendering = True
 
-    # Hide the viewport point cloud during final renders; the render mesh
-    # (SplatbusPointCloudRender) is the only one that should contribute.
-    vp_obj = bpy.data.objects.get("SplatbusPointCloud")
-    if vp_obj is not None:
-        vp_obj["splatbus_was_hidden_render"] = vp_obj.hide_render
-        vp_obj.hide_render = True
+    # NOTE: Do NOT modify object properties (hide_render etc.) here —
+    # frame_change_pre runs inside depsgraph evaluation and mutating
+    # properties causes segfaults.  Hiding the viewport point cloud is
+    # done exclusively in _on_render_pre which fires before evaluation.
 
     try:
         print(f"[Splatbus] render/frame handler fired")
         c2w = _get_scene_camera_matrix()
-        _send_pose(c2w)
+        # Compute the render camera's intrinsics from the K matrix.
+        cam = bpy.context.scene.camera
+        render_intrinsics = _compute_camera_intrinsics(camera_data=cam.data) if cam is not None else None
+        _send_pose(c2w, intrinsics=render_intrinsics)
         frames = _receive_frames()
         color = frames.get("color")
         depth = frames.get("depth")
@@ -1090,6 +1294,26 @@ class SplatbusConnectOperator(bpy.types.Operator):
         scene.render.resolution_y = sv_h
         scene.render.resolution_percentage = 100
         print(f"[Splatbus] matched render resolution to {sv_w}x{sv_h}")
+
+        # Debug: compare server FOV with Blender camera/viewport FOV.
+        cam_info = _state.client.get_camera_info(cam_idx=0)
+        if cam_info is not None:
+            srv_fov_x, srv_fov_y, srv_w, srv_h = cam_info
+            print(f"[Splatbus] SERVER FOV: fov_x={srv_fov_x:.6f} ({math.degrees(srv_fov_x):.2f}°), fov_y={srv_fov_y:.6f} ({math.degrees(srv_fov_y):.2f}°), {srv_w}x{srv_h}")
+            # Blender scene camera FOV
+            cam = scene.camera
+            if cam is not None:
+                b_fov = _compute_camera_fov(camera_data=cam.data)
+                if b_fov is not None:
+                    bx, by = b_fov
+                    print(f"[Splatbus] BLENDER CAM FOV: fov_x={bx:.6f} ({math.degrees(bx):.2f}°), fov_y={by:.6f} ({math.degrees(by):.2f}°), lens={cam.data.lens}mm, sensor={cam.data.sensor_width}mm")
+            # Blender viewport FOV
+            vp_space = _get_active_viewport_space()
+            if vp_space is not None:
+                vp_fov = _compute_camera_fov(space=vp_space)
+                if vp_fov is not None:
+                    vx, vy = vp_fov
+                    print(f"[Splatbus] BLENDER VP FOV: fov_x={vx:.6f} ({math.degrees(vx):.2f}°), fov_y={vy:.6f} ({math.degrees(vy):.2f}°), lens={vp_space.lens}mm")
 
         img = bpy.data.images.get("SplatbusOutput")
         if img is None or img.size[0] != sv_w or img.size[1] != sv_h:
