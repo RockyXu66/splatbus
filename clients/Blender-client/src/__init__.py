@@ -96,20 +96,50 @@ def _update_show_point_cloud(self, context):
                 area.tag_redraw()
 
 
+def _ensure_shadow_catcher_material():
+    """Create the neutral material used by the Cycles shadow catcher proxy."""
+    mat = bpy.data.materials.get("SplatbusShadowCatcher")
+    if mat is None:
+        mat = bpy.data.materials.new("SplatbusShadowCatcher")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+        output = nodes.new(type='ShaderNodeOutputMaterial')
+        diffuse = nodes.new(type='ShaderNodeBsdfDiffuse')
+        diffuse.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+        links.new(diffuse.outputs['BSDF'], output.inputs['Surface'])
+    return mat
+
+
 def _set_render_point_cloud_visibility(obj, enabled):
-    """Set Cycles/EEVEE ray visibility on the render mesh."""
+    """Set Cycles/EEVEE ray visibility on the render point cloud.
+
+    When enabled, the point cloud is marked as a Cycles shadow catcher. Cycles
+    then hides the proxy from the beauty render while emitting a shadow pass
+    that can be composited onto the SplatBus image.
+    """
     if enabled:
         obj.hide_render = False
-        # Invisible to camera rays but contributes to diffuse/glossy/
-        # transmission/volume/shadow lighting.
-        obj.visible_camera = False
+        # Shadow catchers must be camera-visible; Cycles hides them via the
+        # object-level flag while still evaluating shadows on the surface.
+        obj.visible_camera = True
         obj.visible_diffuse = True
         obj.visible_glossy = True
         obj.visible_transmission = True
         obj.visible_volume_scatter = True
         obj.visible_shadow = True
+        if hasattr(obj, "is_shadow_catcher"):
+            obj.is_shadow_catcher = True
+        sc_mat = _ensure_shadow_catcher_material()
+        if obj.data.materials:
+            obj.data.materials[0] = sc_mat
+        else:
+            obj.data.materials.append(sc_mat)
     else:
         obj.hide_render = True
+        if hasattr(obj, "is_shadow_catcher"):
+            obj.is_shadow_catcher = False
         obj.visible_camera = True
         obj.visible_diffuse = True
         obj.visible_glossy = True
@@ -133,6 +163,13 @@ def _update_point_cloud_scale(self, context):
         obj = bpy.data.objects.get(name)
         if obj is not None:
             obj.scale = scale
+
+
+def _update_shadow_blur(self, context):
+    """Rebuild compositor nodes when shadow smoothing changes."""
+    scene = context.scene
+    if getattr(scene.splatbus_setup, "in_use", False):
+        _setup_compositor()
 
 
 def _update_in_use(self, context):
@@ -199,6 +236,14 @@ class SplatbusProperties(bpy.types.PropertyGroup):
         step=0.1,
         precision=3,
         update=_update_point_cloud_scale,
+    )
+    shadow_blur: IntProperty(
+        name="Shadow blur",
+        description="Pixel blur applied only to the Cycles shadow-catcher pass to hide point receiver footprints",
+        default=12,
+        min=0,
+        max=128,
+        update=_update_shadow_blur,
     )
     host: StringProperty(
         name="Server host",
@@ -1008,7 +1053,7 @@ def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None
         props = bpy.context.scene.splatbus_setup
         scale = props.point_cloud_scale
         size = props.point_cloud_size
-        positions_scaled = positions.astype(np.float32) * scale
+        positions_scaled = positions.astype(np.float32)
 
         if colors is not None and colors.shape == (n, 3):
             print(f"[Splatbus] creating Col attribute from colors {colors.shape}, range [{colors.min():.3f}, {colors.max():.3f}]")
@@ -1041,7 +1086,7 @@ def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None
                 space.shading.type = 'SOLID'
                 space.shading.color_type = 'VERTEX'
 
-        # Shared material for both objects.
+        # Coloured material for viewport point cloud.
         mat = bpy.data.materials.get("SplatbusPointCloud")
         if mat is None:
             mat = bpy.data.materials.new("SplatbusPointCloud")
@@ -1055,14 +1100,19 @@ def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None
             attr_node.attribute_name = "Col"
             links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
             links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-        if render_obj.data.materials:
-            render_obj.data.materials[0] = mat
-        else:
-            render_obj.data.materials.append(mat)
         if vp_obj.data.materials:
             vp_obj.data.materials[0] = mat
         else:
             vp_obj.data.materials.append(mat)
+
+        # Assign the neutral catcher material before applying the Cycles
+        # object-level shadow-catcher flag.
+        sc_mat = _ensure_shadow_catcher_material()
+        if render_obj.data.materials:
+            render_obj.data.materials[0] = sc_mat
+        else:
+            render_obj.data.materials.append(sc_mat)
+        _set_render_point_cloud_visibility(render_obj, props.render_point_cloud)
 
         _state.point_cloud_object = vp_obj
         print(f"[Splatbus] loaded point cloud: {n} points, scale={scale}, size={size}")
@@ -1087,6 +1137,20 @@ def _setup_compositor():
         pass
     # Enable the Z‑depth pass for depth‑based compositing.
     scene.view_layers[0].use_pass_z = True
+    # Enable the dedicated Cycles shadow-catcher pass used for point-cloud
+    # shadow compositing. The generic "Shadow" pass is not an attenuation map
+    # and exposes the catcher point coverage as dark blobs.
+    view_layer = scene.view_layers[0]
+    if hasattr(view_layer, "cycles") and hasattr(view_layer.cycles, "use_pass_shadow_catcher"):
+        try:
+            view_layer.cycles.use_pass_shadow_catcher = True
+        except Exception:
+            pass
+    elif hasattr(view_layer, "use_pass_shadow_catcher"):
+        try:
+            view_layer.use_pass_shadow_catcher = True
+        except Exception:
+            pass
     tree = scene.node_tree
     if tree is None:
         print("[Splatbus] ERROR: scene.node_tree is None")
@@ -1136,6 +1200,8 @@ def _setup_compositor():
 
     rl = tree.nodes.new("CompositorNodeRLayers")
     rl.location = (-900, 0)
+    props = getattr(scene, "splatbus_setup", None)
+    shadow_blur = int(getattr(props, "shadow_blur", 12))
 
     node_color = tree.nodes.new("CompositorNodeImage")
     node_color.location = (-900, 300)
@@ -1225,6 +1291,42 @@ def _setup_compositor():
     mask_blur.size_y = 2
     tree.links.new(final_mask.outputs[0], mask_blur.inputs["Image"])
 
+    # ── Shadow catcher compositing ──
+    # Darken the Splatbus image where the point-cloud shadow catcher receives
+    # shadows from scene objects. The dedicated Shadow Catcher pass is white
+    # when unshadowed and darker only where a Cycles shadow lands.
+    shadow_mul = tree.nodes.new("CompositorNodeMixRGB")
+    shadow_mul.location = (-500, 80)
+    shadow_mul.blend_type = "MULTIPLY"
+    shadow_mul.inputs[0].default_value = 1.0
+    # Default fallback: multiply by white (no change) if no shadow catcher pass.
+    shadow_mul.inputs[2].default_value = (1.0, 1.0, 1.0, 1.0)
+    tree.links.new(sb_color.outputs["Image"], shadow_mul.inputs[1])
+
+    shadow_output = None
+    for wanted_name in ("shadow catcher", "noisy shadow catcher"):
+        for output in rl.outputs:
+            if output.name.lower() == wanted_name:
+                shadow_output = output
+                break
+        if shadow_output is not None:
+            break
+    if shadow_output is not None:
+        shadow_desat = tree.nodes.new("CompositorNodeHueSat")
+        shadow_desat.location = (-900, 80)
+        shadow_desat.inputs["Saturation"].default_value = 0.0
+        tree.links.new(shadow_output, shadow_desat.inputs["Image"])
+        shadow_factor = shadow_desat.outputs["Image"]
+        if shadow_blur > 0:
+            shadow_blur_node = tree.nodes.new("CompositorNodeBlur")
+            shadow_blur_node.location = (-700, 80)
+            shadow_blur_node.filter_type = 'GAUSS'
+            shadow_blur_node.size_x = shadow_blur
+            shadow_blur_node.size_y = shadow_blur
+            tree.links.new(shadow_factor, shadow_blur_node.inputs["Image"])
+            shadow_factor = shadow_blur_node.outputs["Image"]
+        tree.links.new(shadow_factor, shadow_mul.inputs[2])
+
     # Composite: show Splatbus where mask=1, Blender render where mask=0.
     # In Blender 4.x MixRGB, Fac=1 selects input 2 and Fac=0 selects input 1,
     # so Splatbus must be wired to input 2 and the render to input 1.
@@ -1236,7 +1338,7 @@ def _setup_compositor():
     composite.location = (750, 0)
 
     tree.links.new(rl.outputs["Image"], mix.inputs[1])
-    tree.links.new(sb_color.outputs["Image"], mix.inputs[2])
+    tree.links.new(shadow_mul.outputs["Image"], mix.inputs[2])
     tree.links.new(mask_blur.outputs["Image"], mix.inputs[0])
     tree.links.new(mix.outputs["Image"], composite.inputs["Image"])
 
@@ -1506,6 +1608,7 @@ class SCENE_PT_splatbus(bpy.types.Panel):
         box.label(text="Compositor", icon="NODETREE")
         box.prop(props, "in_use")
         box.prop(props, "show_viewport_compositing")
+        box.prop(props, "shadow_blur")
         box.operator("splatbus.setup_compositor", icon="NODETREE")
 
         layout.separator()
