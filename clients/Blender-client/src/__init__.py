@@ -609,7 +609,7 @@ def _update_blender_image(color_np: np.ndarray, alpha_mask: np.ndarray = None):
         return None
     # ClientBuffer flips the server image to top-down (CV2) order; Blender's
     # Image.pixels / gpu textures expect bottom-up (OpenGL) order.
-    color_np = np.flipud(color_np)
+    color_np = np.clip(np.flipud(color_np), 0.0, 1.0)
     if alpha_mask is not None:
         alpha_mask = np.flipud(alpha_mask)
     h, w = color_np.shape[:2]
@@ -620,6 +620,11 @@ def _update_blender_image(color_np: np.ndarray, alpha_mask: np.ndarray = None):
             bpy.data.images.remove(img)
         img = bpy.data.images.new("SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True)
         img.use_fake_user = True
+        if img.colorspace_settings is not None:
+            try:
+                img.colorspace_settings.name = "Non-Color"
+            except Exception:
+                pass
     flat = np.empty(w * h * 4, dtype=np.float32)
     flat[0::4] = color_np[..., 0].ravel()
     flat[1::4] = color_np[..., 1].ravel()
@@ -1104,6 +1109,11 @@ def _setup_compositor():
             "SplatbusOutput", width=w, height=h, alpha=True, float_buffer=True
         )
         img_color.use_fake_user = True
+        if img_color.colorspace_settings is not None:
+            try:
+                img_color.colorspace_settings.name = "Non-Color"
+            except Exception:
+                pass
         # Image datablock changed; the cached GPU texture is no longer valid.
         _state.gpu_texture = None
     # ── Splatbus depth image ──
@@ -1130,6 +1140,16 @@ def _setup_compositor():
     node_color = tree.nodes.new("CompositorNodeImage")
     node_color.location = (-900, 300)
     node_color.image = img_color
+
+    # Color correction: lets the user tweak gamma/brightness/contrast of the
+    # Splatbus image directly in the compositor.
+    sb_color = tree.nodes.new("CompositorNodeColorCorrection")
+    sb_color.label = "SplatBus Color"
+    sb_color.location = (-700, 300)
+    # Default gamma to 1.0 (linear passthrough).  Users can raise it if the
+    # SplatBus image looks too dark, or lower it if too bright.
+    sb_color.inputs["Gamma"].default_value = 1.0
+    tree.links.new(node_color.outputs["Image"], sb_color.inputs["Image"])
 
     node_depth = tree.nodes.new("CompositorNodeImage")
     node_depth.location = (-900, 550)
@@ -1216,7 +1236,7 @@ def _setup_compositor():
     composite.location = (750, 0)
 
     tree.links.new(rl.outputs["Image"], mix.inputs[1])
-    tree.links.new(node_color.outputs["Image"], mix.inputs[2])
+    tree.links.new(sb_color.outputs["Image"], mix.inputs[2])
     tree.links.new(mask_blur.outputs["Image"], mix.inputs[0])
     tree.links.new(mix.outputs["Image"], composite.inputs["Image"])
 
