@@ -70,6 +70,7 @@ class _SplatbusState:
     canonical_c2w: Optional[np.ndarray] = None
     is_rendering: bool = False
     render_end_time: float = 0.0
+    point_cloud_object: Optional[object] = None
 
 _state = _SplatbusState()
 
@@ -77,11 +78,59 @@ _state = _SplatbusState()
 # ===================== PROPERTIES =====================
 
 
+def _update_show_point_cloud(self, context):
+    """Toggle point cloud object visibility in the viewport and render."""
+    obj = bpy.data.objects.get("SplatbusPointCloud")
+    if obj is not None:
+        obj.hide_viewport = not self.show_point_cloud
+        obj.hide_render = not self.show_point_cloud
+        # Also force an immediate viewport visibility update.
+        obj.hide_set(not self.show_point_cloud)
+        # Update viewport
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+def _update_in_use(self, context):
+    """Enable/disable SplatBus compositing in the final render."""
+    scene = context.scene
+    if not scene.use_nodes:
+        return
+    tree = scene.node_tree
+    if tree is None:
+        return
+    if self.in_use:
+        _setup_compositor()
+    else:
+        # Clear compositor and connect render layers directly to composite.
+        for n in list(tree.nodes):
+            tree.nodes.remove(n)
+        rl = tree.nodes.new("CompositorNodeRLayers")
+        rl.location = (-300, 0)
+        comp = tree.nodes.new("CompositorNodeComposite")
+        comp.location = (300, 0)
+        tree.links.new(rl.outputs["Image"], comp.inputs["Image"])
+        tree.update_tag()
+
+
 class SplatbusProperties(bpy.types.PropertyGroup):
     in_use: BoolProperty(
         name="Render SplatBus content",
         description="Whether to render content received from SplatBus.",
         default=True,
+        update=_update_in_use,
+    )
+    show_viewport_compositing: BoolProperty(
+        name="Show viewport background",
+        description="Draw the SplatBus rendered frame behind the 3D scene in the viewport",
+        default=True,
+    )
+    show_point_cloud: BoolProperty(
+        name="Show point cloud",
+        description="Display the Gaussian Splatting point cloud in the viewport",
+        default=True,
+        update=_update_show_point_cloud,
     )
     host: StringProperty(
         name="Server host",
@@ -390,6 +439,10 @@ def _tick():
 
 
 def _draw_viewport():
+    props = bpy.context.scene.splatbus_setup
+    if not props.show_viewport_compositing:
+        return
+
     img = bpy.data.images.get("SplatbusOutput")
     if img is None:
         return
@@ -481,6 +534,7 @@ def _stop():
 
     _state.gpu_texture = None
     _state.canonical_c2w = None
+    _state.point_cloud_object = None
 
     for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_init):
         try:
@@ -495,6 +549,9 @@ def _stop():
 
 def _on_frame_change(_scene=None, _depsgraph=None):
     if not _state.is_running:
+        return
+    props = bpy.context.scene.splatbus_setup
+    if not props.in_use:
         return
     _state.is_rendering = True
     try:
@@ -548,6 +605,101 @@ def _on_render_complete(_scene=None):
     # Drop the cached GPU texture; the viewport draw handler will rebuild it
     # safely once a valid draw context exists again.
     _state.gpu_texture = None
+
+
+def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None):
+    """Create/update the SplatbusPointCloud object from Gaussian positions and colors."""
+    if positions is None or positions.size == 0:
+        print("[Splatbus] no Gaussian positions received")
+        return None
+
+    # Remove any existing Splatbus point cloud object/mesh.
+    old_obj = bpy.data.objects.get("SplatbusPointCloud")
+    if old_obj is not None:
+        mesh = old_obj.data
+        bpy.data.objects.remove(old_obj)
+        if mesh is not None and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+    try:
+        n = len(positions)
+        mesh = bpy.data.meshes.new("SplatbusPointCloud")
+        mesh.vertices.add(n)
+        mesh.vertices.foreach_set("co", positions.ravel())
+
+        if colors is not None and colors.shape == (n, 3):
+            print(f"[Splatbus] creating Col attribute from colors {colors.shape}, range [{colors.min():.3f}, {colors.max():.3f}]")
+            rgba = np.concatenate([colors.astype(np.float32), np.ones((n, 1), dtype=np.float32)], axis=1)
+        else:
+            print(f"[Splatbus] no valid colors supplied (colors={colors}), using white Col attribute")
+            rgba = np.ones((n, 4), dtype=np.float32)
+        attr = mesh.attributes.new(name="Col", type='FLOAT_COLOR', domain='POINT')
+        attr.data.foreach_set("color", rgba.ravel())
+        mesh.attributes.active = attr
+        mesh.update()
+
+        obj = bpy.data.objects.new("SplatbusPointCloud", mesh)
+        bpy.context.collection.objects.link(obj)
+
+        # Convert to Blender's native PointCloud object.  This gives real viewport
+        # points whose size can be adjusted via the viewport overlay settings.
+        bpy.context.view_layer.objects.active = obj
+        for o in bpy.context.selected_objects:
+            o.select_set(False)
+        obj.select_set(True)
+        try:
+            bpy.ops.object.convert(target='POINTCLOUD')
+        except Exception as conv_err:
+            print(f"[Splatbus] point-cloud conversion failed, keeping mesh: {conv_err}")
+        pc = obj.data
+        if "Col" in pc.attributes:
+            pc.attributes.active = pc.attributes["Col"]
+        if mesh is not None and mesh.users == 0:
+            try:
+                bpy.data.meshes.remove(mesh)
+            except Exception:
+                pass
+
+        obj.display_type = 'SOLID'
+
+        # Build/reuse a material that reads the Col attribute.  In solid viewport
+        # shading Blender's workbench evaluates this for point clouds.
+        mat = bpy.data.materials.get("SplatbusPointCloud")
+        if mat is None:
+            mat = bpy.data.materials.new("SplatbusPointCloud")
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            nodes.clear()
+            output = nodes.new(type='ShaderNodeOutputMaterial')
+            bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+            attr_node = nodes.new(type='ShaderNodeAttribute')
+            attr_node.attribute_name = "Col"
+            links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
+            links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+        if obj.data.materials:
+            obj.data.materials[0] = mat
+        else:
+            obj.data.materials.append(mat)
+
+        # Ensure viewport solid shading uses the point-cloud color attribute.
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                space = area.spaces[0]
+                space.shading.type = 'SOLID'
+                space.shading.color_type = 'VERTEX'
+
+        props = bpy.context.scene.splatbus_setup
+        obj.hide_viewport = not props.show_point_cloud
+        obj.hide_render = not props.show_point_cloud
+
+        _state.point_cloud_object = obj
+        print(f"[Splatbus] loaded point cloud: {len(positions)} points")
+        return obj
+    except Exception as e:
+        print(f"[Splatbus] failed to load point cloud: {e}")
+        traceback.print_exc()
+        return None
 
 
 # ===================== COMPOSITOR =====================
@@ -756,6 +908,20 @@ class SplatbusConnectOperator(bpy.types.Operator):
         print(f"[Splatbus] Server initial pose — t: {t}, quat: {quat}")
         _apply_server_canonical_pose(t, quat)
 
+        # Request Gaussian positions from the server and build a viewport point cloud.
+        gaussian_data = _state.client.get_gaussians()
+        print(f"[Splatbus] get_gaussians returned type={type(gaussian_data)}")
+        if gaussian_data is not None:
+            # New client returns (positions, colors); old client returns positions only.
+            if isinstance(gaussian_data, tuple):
+                positions, colors = gaussian_data
+                print(f"[Splatbus] gaussians positions={positions.shape} colors={colors.shape if colors is not None else None}")
+            else:
+                positions = gaussian_data
+                colors = None
+                print("[Splatbus] WARNING: old splatbus client returned positions only; reinstall the bundled wheel to get colors")
+            _load_point_cloud(positions, colors)
+
         _start()
         self.report({"INFO"}, "Connected to SplatBus")
         return {"FINISHED"}
@@ -902,7 +1068,14 @@ class SCENE_PT_splatbus(bpy.types.Panel):
         box = layout.box()
         box.label(text="Compositor", icon="NODETREE")
         box.prop(props, "in_use")
+        box.prop(props, "show_viewport_compositing")
         box.operator("splatbus.setup_compositor", icon="NODETREE")
+
+        layout.separator()
+
+        box = layout.box()
+        box.label(text="Point Cloud", icon="POINTCLOUD_DATA")
+        box.prop(props, "show_point_cloud")
 
         col = layout.column()
         col.enabled = _state.is_running

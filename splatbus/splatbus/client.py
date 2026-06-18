@@ -215,8 +215,40 @@ class GaussianSplattingIPCClient:
             position = default_position
             rotation = default_rotation
         return np.array(position), np.array(rotation)
-        
-        
+
+    def get_gaussians(self) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        """
+        Request the 3D Gaussian positions and colors from the server.
+        Returns a tuple (positions, colors) where positions is (N, 3) float32
+        and colors is (N, 3) float32 RGB or None if not provided.
+        """
+        import base64
+        payload = {"type": "get_gaussians"}
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)
+        except Exception as e:
+            logger.warning(f"[IPCClient] get_gaussians request failed: {e}")
+            return None
+        if json_msg is None:
+            return None
+        count = json_msg.get("count", 0)
+        positions_b64 = json_msg.get("positions", "")
+        colors_b64 = json_msg.get("colors", "")
+        if count == 0 or not positions_b64:
+            return None
+        try:
+            raw = base64.b64decode(positions_b64)
+            xyz = np.frombuffer(raw, dtype=np.float32).reshape(count, 3)
+            if colors_b64:
+                raw_color = base64.b64decode(colors_b64)
+                rgb = np.frombuffer(raw_color, dtype=np.float32).reshape(count, 3)
+            else:
+                rgb = None
+            return xyz, rgb
+        except Exception as e:
+            logger.warning(f"[IPCClient] failed to decode gaussians: {e}")
+            return None
 
     def send_camera_pose(self, position: Dict[str, float], rotation: Dict[str, float]):
         """

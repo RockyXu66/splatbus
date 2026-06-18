@@ -1,3 +1,4 @@
+import base64
 import socket
 import warnings
 from typing import Dict, Optional, List
@@ -27,6 +28,8 @@ class MessageSocketServer(BaseSocketServer):
         self._point_cloud_pose = None
         self.gaussians_xyz_ori = None
         self.gaussians_rotation_ori = None
+        self.gaussians_xyz = None
+        self.gaussians_color = None
         self.flip_y = flip_y
         self.flip_z = flip_z
         super().__init__(host=host, port=port, server_name="MessageSocketServer")
@@ -133,6 +136,17 @@ class MessageSocketServer(BaseSocketServer):
                 np.array([pos["x"], pos["y"], pos["z"]])
             ).float().to(gaussians._xyz.device)
 
+        # Cache current posed positions and base RGB color for the Blender client.
+        self.gaussians_xyz = gaussians._xyz.detach().clone()
+        features_dc = getattr(gaussians, "_features_dc", None)
+        if features_dc is not None:
+            color = torch.sigmoid(features_dc.detach().clone())
+            if color.dim() == 3 and color.shape[1] == 1:
+                color = color.squeeze(1)
+            self.gaussians_color = color
+        else:
+            self.gaussians_color = None
+
     def _handle_payload(self, payload: dict):
         if payload.get("type") == "camera_pose":
             self._cam_pose = payload
@@ -156,6 +170,22 @@ class MessageSocketServer(BaseSocketServer):
                 t = np.array([0.0, 0.0, 0.0])
                 quat = np.array([0.0, 0.0, 0.0, 1.0])
             self.send_message({"position": t.tolist(), "rotation": quat.tolist()})
+        elif payload.get("type") == "get_gaussians":
+            if self.gaussians_xyz is None:
+                self.send_message({"count": 0, "positions": "", "colors": ""})
+            else:
+                xyz = self.gaussians_xyz.cpu().numpy().astype(np.float32)
+                positions_b64 = base64.b64encode(xyz.tobytes()).decode("utf-8")
+                if self.gaussians_color is not None:
+                    rgb = self.gaussians_color.cpu().numpy().astype(np.float32)
+                    colors_b64 = base64.b64encode(rgb.tobytes()).decode("utf-8")
+                else:
+                    colors_b64 = ""
+                self.send_message({
+                    "count": xyz.shape[0],
+                    "positions": positions_b64,
+                    "colors": colors_b64,
+                })
         else:
             logger.debug(
                 f"[MessageSocketServer] Unknown payload type: {payload.get('type')}"
