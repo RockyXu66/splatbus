@@ -23,6 +23,7 @@ from bpy.props import (
     IntProperty,
     StringProperty,
     PointerProperty,
+    FloatProperty,
 )
 from mathutils import Matrix, Vector, Quaternion
 
@@ -84,17 +85,53 @@ _state = _SplatbusState()
 
 
 def _update_show_point_cloud(self, context):
-    """Toggle point cloud object visibility in the viewport and render."""
+    """Toggle the viewport point-cloud object visibility only."""
     obj = bpy.data.objects.get("SplatbusPointCloud")
     if obj is not None:
         obj.hide_viewport = not self.show_point_cloud
-        obj.hide_render = not self.show_point_cloud
-        # Also force an immediate viewport visibility update.
         obj.hide_set(not self.show_point_cloud)
-        # Update viewport
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
+
+
+def _set_render_point_cloud_visibility(obj, enabled):
+    """Set Cycles/EEVEE ray visibility on the render mesh."""
+    if enabled:
+        obj.hide_render = False
+        # Invisible to camera rays but contributes to diffuse/glossy/
+        # transmission/volume/shadow lighting.
+        obj.visible_camera = False
+        obj.visible_diffuse = True
+        obj.visible_glossy = True
+        obj.visible_transmission = True
+        obj.visible_volume_scatter = True
+        obj.visible_shadow = True
+    else:
+        obj.hide_render = True
+        obj.visible_camera = True
+        obj.visible_diffuse = True
+        obj.visible_glossy = True
+        obj.visible_transmission = True
+        obj.visible_volume_scatter = True
+        obj.visible_shadow = True
+
+
+def _update_render_point_cloud(self, context):
+    """Toggle the render point-cloud mesh visibility and Cycles ray types."""
+    obj = bpy.data.objects.get("SplatbusPointCloudRender")
+    if obj is None:
+        return
+    _set_render_point_cloud_visibility(obj, self.render_point_cloud)
+
+
+def _update_point_cloud_scale(self, context):
+    """Scale both point-cloud objects to align the proxy with the SplatBus render."""
+    scale = (self.point_cloud_scale,) * 3
+    for name in ("SplatbusPointCloud", "SplatbusPointCloudRender"):
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            obj.scale = scale
 
 
 def _update_in_use(self, context):
@@ -136,6 +173,31 @@ class SplatbusProperties(bpy.types.PropertyGroup):
         description="Display the Gaussian Splatting point cloud in the viewport",
         default=True,
         update=_update_show_point_cloud,
+    )
+    render_point_cloud: BoolProperty(
+        name="Render point cloud",
+        description="Include the Gaussian Splatting point cloud in Cycles renders for lighting/reflections/shadows (invisible to camera)",
+        default=False,
+        update=_update_render_point_cloud,
+    )
+    point_cloud_size: FloatProperty(
+        name="Point size",
+        description="World-space size of the point-cloud proxy triangles used for Cycles lighting",
+        default=0.02,
+        min=0.0001,
+        max=1.0,
+        step=0.01,
+        precision=4,
+    )
+    point_cloud_scale: FloatProperty(
+        name="Point cloud scale",
+        description="Scale applied to Gaussian point positions to align the point cloud with the SplatBus render",
+        default=1.0,
+        min=0.001,
+        max=10.0,
+        step=0.1,
+        precision=3,
+        update=_update_point_cloud_scale,
     )
     host: StringProperty(
         name="Server host",
@@ -528,6 +590,9 @@ def _start():
     for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_init):
         if _on_frame_change not in h:
             h.append(_on_frame_change)
+    if bpy.app.handlers.render_pre is not None:
+        if _on_render_pre not in bpy.app.handlers.render_pre:
+            bpy.app.handlers.render_pre.append(_on_render_pre)
     if _on_render_complete not in bpy.app.handlers.render_complete:
         bpy.app.handlers.render_complete.append(_on_render_complete)
 
@@ -577,10 +642,24 @@ def _stop():
             h.remove(_on_frame_change)
         except ValueError:
             pass
+    if bpy.app.handlers.render_pre is not None:
+        try:
+            bpy.app.handlers.render_pre.remove(_on_render_pre)
+        except ValueError:
+            pass
     try:
         bpy.app.handlers.render_complete.remove(_on_render_complete)
     except ValueError:
         pass
+
+
+def _on_render_pre(_scene=None):
+    """Hide viewport point cloud right before render evaluation starts."""
+    vp_obj = bpy.data.objects.get("SplatbusPointCloud")
+    if vp_obj is not None:
+        vp_obj["splatbus_was_hidden_render"] = vp_obj.hide_render
+        vp_obj.hide_render = True
+        print(f"[Splatbus] render_pre: hid viewport point cloud (was {vp_obj['splatbus_was_hidden_render']})")
 
 
 def _on_frame_change(_scene=None, _depsgraph=None):
@@ -590,6 +669,14 @@ def _on_frame_change(_scene=None, _depsgraph=None):
     if not props.in_use:
         return
     _state.is_rendering = True
+
+    # Hide the viewport point cloud during final renders; the render mesh
+    # (SplatbusPointCloudRender) is the only one that should contribute.
+    vp_obj = bpy.data.objects.get("SplatbusPointCloud")
+    if vp_obj is not None:
+        vp_obj["splatbus_was_hidden_render"] = vp_obj.hide_render
+        vp_obj.hide_render = True
+
     try:
         print(f"[Splatbus] render/frame handler fired")
         c2w = _get_scene_camera_matrix()
@@ -616,20 +703,13 @@ def _on_frame_change(_scene=None, _depsgraph=None):
             _update_depth_image(depth)
             print(f"[Splatbus] depth min={depth.min():.4f} max={depth.max():.4f}")
 
-        # ── Force compositor Image nodes to refresh after update ──
+        # ── Notify the compositor that the image datablocks changed ──
         try:
             scene = bpy.context.scene
             if scene.node_tree is not None:
-                for node in scene.node_tree.nodes:
-                    if node.type == "IMAGE" and node.image is not None:
-                        if node.image.name in ("SplatbusOutput", "SplatbusDepth"):
-                            img = node.image
-                            node.image = None
-                            node.image = img
-                            print(f"[Splatbus] refreshed compositor image node: {img.name}")
                 scene.node_tree.update_tag()
         except Exception as refresh_err:
-            print(f"[Splatbus] image node refresh failed: {refresh_err}")
+            print(f"[Splatbus] compositor refresh failed: {refresh_err}")
     except Exception:
         traceback.print_exc()
 
@@ -642,64 +722,126 @@ def _on_render_complete(_scene=None):
     # safely once a valid draw context exists again.
     _state.gpu_texture = None
 
+    # Restore viewport point cloud render visibility if we changed it.
+    vp_obj = bpy.data.objects.get("SplatbusPointCloud")
+    if vp_obj is not None and "splatbus_was_hidden_render" in vp_obj:
+        vp_obj.hide_render = vp_obj["splatbus_was_hidden_render"]
+        del vp_obj["splatbus_was_hidden_render"]
+
+
+def _create_point_cloud_object(name, positions, rgba, radius=None):
+    """Create a native Blender PointCloud object from raw arrays.
+
+    ``positions`` is (N, 3) float32, ``rgba`` is (N, 4) float32.
+    ``radius`` is either a scalar or (N,) float32 array; if None the Cycles
+    default radius is used.
+    Returns the linked object.
+    """
+    n = len(positions)
+    mesh = bpy.data.meshes.new(name)
+    mesh.vertices.add(n)
+    mesh.vertices.foreach_set("co", positions.astype(np.float32).ravel())
+    col = mesh.attributes.new(name="Col", type='FLOAT_COLOR', domain='POINT')
+    col.data.foreach_set("color", rgba.astype(np.float32).ravel())
+    mesh.attributes.active = col
+    if radius is not None:
+        r = mesh.attributes.new(name="radius", type='FLOAT', domain='POINT')
+        vals = np.full(n, radius, dtype=np.float32) if np.isscalar(radius) else radius.astype(np.float32)
+        r.data.foreach_set("value", vals.ravel())
+    mesh.update()
+
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    for o in bpy.context.selected_objects:
+        o.select_set(False)
+    obj.select_set(True)
+    try:
+        bpy.ops.object.convert(target='POINTCLOUD')
+    except Exception as conv_err:
+        print(f"[Splatbus] point-cloud conversion failed for {name}: {conv_err}")
+    pc = obj.data
+    if "Col" in pc.attributes:
+        pc.attributes.active = pc.attributes["Col"]
+    if mesh is not None and mesh.users == 0:
+        try:
+            bpy.data.meshes.remove(mesh)
+        except Exception:
+            pass
+    return obj
+
 
 def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None):
-    """Create/update the SplatbusPointCloud object from Gaussian positions and colors."""
+    """Create/update the Splatbus point cloud.
+
+    Two native PointCloud objects are created:
+      * "SplatbusPointCloud"        - for nice viewport display (colored dots).
+      * "SplatbusPointCloudRender"  - Cycles lighting proxy with visible_camera=False
+                                      so it lights/reflects/shadows the scene without
+                                      being visible in the rendered image.
+    The point positions can be scaled with the point_cloud_scale property.
+    """
     if positions is None or positions.size == 0:
         print("[Splatbus] no Gaussian positions received")
         return None
 
-    # Remove any existing Splatbus point cloud object/mesh.
-    old_obj = bpy.data.objects.get("SplatbusPointCloud")
-    if old_obj is not None:
-        mesh = old_obj.data
-        bpy.data.objects.remove(old_obj)
-        if mesh is not None and mesh.users == 0:
-            bpy.data.meshes.remove(mesh)
-
-    try:
-        n = len(positions)
-        mesh = bpy.data.meshes.new("SplatbusPointCloud")
-        mesh.vertices.add(n)
-        mesh.vertices.foreach_set("co", positions.ravel())
-
-        if colors is not None and colors.shape == (n, 3):
-            print(f"[Splatbus] creating Col attribute from colors {colors.shape}, range [{colors.min():.3f}, {colors.max():.3f}]")
-            rgba = np.concatenate([colors.astype(np.float32), np.ones((n, 1), dtype=np.float32)], axis=1)
-        else:
-            print(f"[Splatbus] no valid colors supplied (colors={colors}), using white Col attribute")
-            rgba = np.ones((n, 4), dtype=np.float32)
-        attr = mesh.attributes.new(name="Col", type='FLOAT_COLOR', domain='POINT')
-        attr.data.foreach_set("color", rgba.ravel())
-        mesh.attributes.active = attr
-        mesh.update()
-
-        obj = bpy.data.objects.new("SplatbusPointCloud", mesh)
-        bpy.context.collection.objects.link(obj)
-
-        # Convert to Blender's native PointCloud object.  This gives real viewport
-        # points whose size can be adjusted via the viewport overlay settings.
-        bpy.context.view_layer.objects.active = obj
-        for o in bpy.context.selected_objects:
-            o.select_set(False)
-        obj.select_set(True)
-        try:
-            bpy.ops.object.convert(target='POINTCLOUD')
-        except Exception as conv_err:
-            print(f"[Splatbus] point-cloud conversion failed, keeping mesh: {conv_err}")
-        pc = obj.data
-        if "Col" in pc.attributes:
-            pc.attributes.active = pc.attributes["Col"]
-        if mesh is not None and mesh.users == 0:
+    def _remove_object(name):
+        old = bpy.data.objects.get(name)
+        if old is None:
+            return
+        data = old.data
+        bpy.data.objects.remove(old)
+        if data is not None and data.users == 0:
             try:
-                bpy.data.meshes.remove(mesh)
+                if isinstance(data, bpy.types.Mesh):
+                    bpy.data.meshes.remove(data)
+                elif isinstance(data, bpy.types.PointCloud):
+                    bpy.data.pointclouds.remove(data)
             except Exception:
                 pass
 
-        obj.display_type = 'SOLID'
+    _remove_object("SplatbusPointCloud")
+    _remove_object("SplatbusPointCloudRender")
 
-        # Build/reuse a material that reads the Col attribute.  In solid viewport
-        # shading Blender's workbench evaluates this for point clouds.
+    try:
+        n = len(positions)
+        props = bpy.context.scene.splatbus_setup
+        scale = props.point_cloud_scale
+        size = props.point_cloud_size
+        positions_scaled = positions.astype(np.float32) * scale
+
+        if colors is not None and colors.shape == (n, 3):
+            print(f"[Splatbus] creating Col attribute from colors {colors.shape}, range [{colors.min():.3f}, {colors.max():.3f}]")
+            base_rgba = np.concatenate([colors.astype(np.float32), np.ones((n, 1), dtype=np.float32)], axis=1)
+        else:
+            print(f"[Splatbus] no valid colors supplied (colors={colors}), using white Col attribute")
+            base_rgba = np.ones((n, 4), dtype=np.float32)
+
+        # ── Render proxy PointCloud: camera-invisible, but lights the scene.
+        render_obj = _create_point_cloud_object(
+            "SplatbusPointCloudRender", positions_scaled, base_rgba, radius=size,
+        )
+        render_obj.hide_viewport = True
+        render_obj.scale = (scale,) * 3
+        _set_render_point_cloud_visibility(render_obj, props.render_point_cloud)
+
+        # ── Viewport PointCloud: visible in viewport, hidden from render.
+        vp_obj = _create_point_cloud_object(
+            "SplatbusPointCloud", positions_scaled, base_rgba, radius=size,
+        )
+        vp_obj.display_type = 'SOLID'
+        vp_obj.hide_viewport = not props.show_point_cloud
+        vp_obj.hide_render = True
+        vp_obj.scale = (scale,) * 3
+
+        # Ensure viewport solid shading uses the point-cloud color attribute.
+        for area in bpy.context.screen.areas:
+            if area.type == 'VIEW_3D':
+                space = area.spaces[0]
+                space.shading.type = 'SOLID'
+                space.shading.color_type = 'VERTEX'
+
+        # Shared material for both objects.
         mat = bpy.data.materials.get("SplatbusPointCloud")
         if mat is None:
             mat = bpy.data.materials.new("SplatbusPointCloud")
@@ -713,25 +855,18 @@ def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None
             attr_node.attribute_name = "Col"
             links.new(attr_node.outputs['Color'], bsdf.inputs['Base Color'])
             links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
-        if obj.data.materials:
-            obj.data.materials[0] = mat
+        if render_obj.data.materials:
+            render_obj.data.materials[0] = mat
         else:
-            obj.data.materials.append(mat)
+            render_obj.data.materials.append(mat)
+        if vp_obj.data.materials:
+            vp_obj.data.materials[0] = mat
+        else:
+            vp_obj.data.materials.append(mat)
 
-        # Ensure viewport solid shading uses the point-cloud color attribute.
-        for area in bpy.context.screen.areas:
-            if area.type == 'VIEW_3D':
-                space = area.spaces[0]
-                space.shading.type = 'SOLID'
-                space.shading.color_type = 'VERTEX'
-
-        props = bpy.context.scene.splatbus_setup
-        obj.hide_viewport = not props.show_point_cloud
-        obj.hide_render = not props.show_point_cloud
-
-        _state.point_cloud_object = obj
-        print(f"[Splatbus] loaded point cloud: {len(positions)} points")
-        return obj
+        _state.point_cloud_object = vp_obj
+        print(f"[Splatbus] loaded point cloud: {n} points, scale={scale}, size={size}")
+        return vp_obj
     except Exception as e:
         print(f"[Splatbus] failed to load point cloud: {e}")
         traceback.print_exc()
@@ -1138,6 +1273,9 @@ class SCENE_PT_splatbus(bpy.types.Panel):
         box = layout.box()
         box.label(text="Point Cloud", icon="POINTCLOUD_DATA")
         box.prop(props, "show_point_cloud")
+        box.prop(props, "render_point_cloud")
+        box.prop(props, "point_cloud_size")
+        box.prop(props, "point_cloud_scale")
 
         col = layout.column()
         col.enabled = _state.is_running
