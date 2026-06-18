@@ -1336,9 +1336,14 @@ class SplatbusConnectOperator(bpy.types.Operator):
             img.use_fake_user = True
             _state.gpu_texture = None
 
-        t, quat = _state.client.get_camera_pose(cam_idx=0)
-        print(f"[Splatbus] Server initial pose — t: {t}, quat: {quat}")
-        _apply_server_canonical_pose(t, quat)
+        # Send the current Blender camera pose to the server instead of
+        # overriding it with the server's canonical pose.
+        cam = scene.camera
+        if cam is not None:
+            c2w = _get_scene_camera_matrix()
+            render_intrinsics = _compute_camera_intrinsics(camera_data=cam.data)
+            _send_pose(c2w, intrinsics=render_intrinsics)
+            print(f"[Splatbus] sent Blender camera pose to server on connect")
 
         # Request Gaussian positions from the server and build a viewport point cloud.
         gaussian_data = _state.client.get_gaussians()
