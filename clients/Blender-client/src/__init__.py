@@ -417,12 +417,15 @@ def _fov_from_K(K, width, height):
     return fov_x, fov_y
 
 
-def _compute_camera_intrinsics(camera_data=None, space=None, region=None):
+def _compute_camera_intrinsics(camera_data=None, space=None, region=None, rv3d=None):
     """Compute pinhole intrinsics (fl_x, fl_y, cx, cy, w, h) from a Blender
-    camera or viewport space, using the proven K matrix code path.
+    camera or viewport space.
 
-    Returns a dict with keys fl_x, fl_y, cx, cy, width, height (all in pixels),
-    or None on failure.
+    For a camera object, uses get_calibration_matrix_K_from_blender (proven).
+    For the viewport, extracts the FOV directly from RegionView3D.window_matrix
+    — the actual projection matrix Blender uses — and converts to pinhole
+    intrinsics at the server's render resolution.  This avoids guessing sensor
+    sizes or lens equivalences.
     """
     scene = bpy.context.scene
     if camera_data is not None:
@@ -435,46 +438,36 @@ def _compute_camera_intrinsics(camera_data=None, space=None, region=None):
             "width": info["width"],
             "height": info["height"],
         }
-    elif space is not None:
-        # The viewport uses the same pinhole model with a default 36mm sensor.
-        # Build a temporary Camera data block to reuse the proven K code path.
-        # Use the actual viewport region dimensions so the focal length in
-        # pixels matches what the viewport is actually displaying.
-        if region is not None:
-            vp_w = region.width
-            vp_h = region.height
-            # Temporarily set render resolution to the viewport region size so
-            # get_calibration_matrix_K_from_blender computes K at the right
-            # resolution.
-            orig_rx = scene.render.resolution_x
-            orig_ry = scene.render.resolution_y
-            orig_pct = scene.render.resolution_percentage
-            scene.render.resolution_x = vp_w
-            scene.render.resolution_y = vp_h
-            scene.render.resolution_percentage = 100
-        else:
-            vp_w = scene.render.resolution_x
-            vp_h = scene.render.resolution_y
-        tmp_cam = bpy.data.cameras.new("SplatbusTmpVP")
-        tmp_cam.lens = space.lens
-        tmp_cam.sensor_width = 36.0
-        tmp_cam.sensor_fit = 'HORIZONTAL'
-        try:
-            K, info = get_calibration_matrix_K_from_blender(tmp_cam)
-            return {
-                "fl_x": K[0][0],
-                "fl_y": K[1][1],
-                "cx": K[0][2],
-                "cy": K[1][2],
-                "width": info["width"],
-                "height": info["height"],
-            }
-        finally:
-            bpy.data.cameras.remove(tmp_cam)
-            if region is not None:
-                scene.render.resolution_x = orig_rx
-                scene.render.resolution_y = orig_ry
-                scene.render.resolution_percentage = orig_pct
+    elif rv3d is not None:
+        # Extract the actual viewport projection matrix.  This is the ground
+        # truth — no guessing sensor sizes or lens conventions.
+        P = np.array(rv3d.window_matrix, dtype=np.float64)
+        # For a standard OpenGL perspective matrix:
+        #   P[0][0] = 1 / tan(fov_x / 2)
+        #   P[1][1] = 1 / tan(fov_y / 2)
+        #   P[0][2] encodes horizontal principal point shift
+        #   P[1][2] encodes vertical principal point shift
+        if abs(P[0][0]) < 1e-8 or abs(P[1][1]) < 1e-8:
+            return None
+        fov_x = 2.0 * math.atan(1.0 / P[0][0])
+        fov_y = 2.0 * math.atan(1.0 / P[1][1])
+        # Use the server's render resolution — the server will render at this
+        # resolution with the viewport's FOV.
+        srv_w = _state.width or scene.render.resolution_x
+        srv_h = _state.height or scene.render.resolution_y
+        fl_x = srv_w / (2.0 * math.tan(fov_x / 2.0))
+        fl_y = srv_h / (2.0 * math.tan(fov_y / 2.0))
+        # Principal point: viewport typically has no shift, so center it.
+        cx = srv_w / 2.0
+        cy = srv_h / 2.0
+        return {
+            "fl_x": fl_x,
+            "fl_y": fl_y,
+            "cx": cx,
+            "cy": cy,
+            "width": srv_w,
+            "height": srv_h,
+        }
     return None
 
 
@@ -680,11 +673,9 @@ def _tick():
     try:
         c2w = _get_viewport_camera_matrix()
 
-        # Compute the viewport's intrinsics from its lens setting and actual
-        # region dimensions.
-        vp_space = _get_active_viewport_space()
-        vp_region = _get_active_viewport_region()
-        vp_intrinsics = _compute_camera_intrinsics(space=vp_space, region=vp_region)
+        # Compute the viewport's intrinsics directly from its projection matrix.
+        vp_rv3d = _get_active_viewport_rv3d()
+        vp_intrinsics = _compute_camera_intrinsics(rv3d=vp_rv3d)
 
         # Skip server updates when the viewport camera has not moved and FOV
         # is unchanged.  This eliminates jitter caused by re-uploading
