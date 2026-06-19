@@ -85,6 +85,7 @@ def loop_render(
         ipc_port=6001,
         msg_host="0.0.0.0",
         msg_port=6000,
+        gaussian_max_points=100_000,
     )
     ipc_render.init_view(width=width, height=height, view=views[idx][1])
     cam_list_views = views.viewpoint_stack[:20]
@@ -102,10 +103,16 @@ def loop_render(
             loop_start_time = time.time()
 
             view: splatbus.IPCCamera = ipc_render.get_current_view().cuda()
-            view.timestamp = t_start + (frame_count % num_frames) / num_frames * (
-                t_end - t_start
-            )
-            frame_count += 1
+            ts_override = ipc_render.get_timestamp_override()
+            if ts_override is not None and ts_override >= 0:
+                view.timestamp = t_start + (ts_override % num_frames) / num_frames * (
+                    t_end - t_start
+                )
+            else:
+                view.timestamp = t_start + (frame_count % num_frames) / num_frames * (
+                    t_end - t_start
+                )
+                frame_count += 1
             if live_update_pts:
                 _, delta_mean = gaussians.get_current_covariance_and_mean_offset(
                     1, view.timestamp

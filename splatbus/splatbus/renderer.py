@@ -104,6 +104,10 @@ class GaussianSplattingIPCRenderer:
     def get_current_view(self):
         return self.msg_server.viewpoint
 
+    def get_timestamp_override(self):
+        """Return the optional timestamp index sent by the client, or None."""
+        return self.msg_server.timestamp_override
+
     def update_gaussians(self, gaussians):
         self.msg_server.update_gaussians(gaussians)
 

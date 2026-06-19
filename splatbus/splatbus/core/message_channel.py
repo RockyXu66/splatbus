@@ -27,6 +27,7 @@ class MessageSocketServer(BaseSocketServer):
         self._cam_list: Optional[List[IPCCamera]] = None
         self._cam_pose: Dict[str, Dict[str, float]] = {}
         self._point_cloud_pose = None
+        self._timestamp_override: Optional[int] = None
         self.gaussians_xyz_ori = None
         self.gaussians_rotation_ori = None
         self.gaussians_xyz = None
@@ -50,6 +51,10 @@ class MessageSocketServer(BaseSocketServer):
     @property
     def point_cloud_pose(self):
         return self._point_cloud_pose
+
+    @property
+    def timestamp_override(self) -> Optional[int]:
+        return self._timestamp_override
 
     def send_message(self, payload: dict):
         self.send_json(payload)
@@ -198,6 +203,7 @@ class MessageSocketServer(BaseSocketServer):
     def _handle_payload(self, payload: dict):
         if payload.get("type") == "camera_pose":
             self._cam_pose = payload
+            self._timestamp_override = payload.get("timestamp_index", None)
             self._update_viewpoint_from_cam_pose()
         elif payload.get("type") == "point_cloud_pose":
             self._point_cloud_pose = payload
@@ -235,6 +241,8 @@ class MessageSocketServer(BaseSocketServer):
                 "width": width,
                 "height": height,
             })
+        elif payload.get("type") == "timestamp":
+            self._timestamp_override = payload.get("timestamp_index", None)
         elif payload.get("type") == "get_gaussians":
             gaussians_xyz = self.gaussians_xyz
             gaussians_color = self.gaussians_color

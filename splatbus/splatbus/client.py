@@ -317,6 +317,7 @@ class GaussianSplattingIPCClient:
         cy: float = None,
         intr_width: int = None,
         intr_height: int = None,
+        timestamp_index: int = None,
     ):
         """
         Send camera pose
@@ -325,6 +326,7 @@ class GaussianSplattingIPCClient:
         fov_x, fov_y: optional field-of-view (radians) to override the server default
         fl_x, fl_y, cx, cy: optional pinhole intrinsics in pixels (COLMAP PINHOLE model)
         intr_width, intr_height: resolution at which the intrinsics were computed
+        timestamp_index: optional frame index for 4DGS sync
         """
         payload = {
             "type": "camera_pose",
@@ -347,6 +349,16 @@ class GaussianSplattingIPCClient:
             payload["intr_width"] = int(intr_width)
         if intr_height is not None:
             payload["intr_height"] = int(intr_height)
+        if timestamp_index is not None:
+            payload["timestamp_index"] = int(timestamp_index)
+        self._send_json(self.msg_sock, payload)
+
+    def send_timestamp_index(self, timestamp_index: int):
+        """Send a timestamp frame index to the server (lightweight, no camera pose)."""
+        payload = {
+            "type": "timestamp",
+            "timestamp_index": int(timestamp_index),
+        }
         self._send_json(self.msg_sock, payload)
 
     def send_point_cloud_pose(self, position: Dict[str, float], rotation: Dict[str, float]):

@@ -25,6 +25,7 @@ from bpy.props import (
     StringProperty,
     PointerProperty,
     FloatProperty,
+    EnumProperty,
 )
 from mathutils import Matrix, Vector, Quaternion
 
@@ -80,6 +81,10 @@ class _SplatbusState:
     last_camera_rotation: Optional[np.ndarray] = None
 
     last_point_cloud_update: float = 0.0
+
+    # Sub-sampled point cloud index cache (reuse when count is stable).
+    pc_subsample_total: int = 0
+    pc_subsample_indices: Optional[np.ndarray] = None
 
 _state = _SplatbusState()
 
@@ -244,6 +249,11 @@ class SplatbusProperties(bpy.types.PropertyGroup):
         description="Periodically refresh point cloud from the server. Disable if too slow.",
         default=True,
     )
+    point_cloud_subsample: BoolProperty(
+        name="Subsample",
+        description="Sub-sample to 100K points when the count exceeds the limit. Disable to show all points.",
+        default=True,
+    )
     point_cloud_fps: FloatProperty(
         name="PC refresh rate",
         description="How many times per second to refresh the point cloud from the server",
@@ -252,6 +262,40 @@ class SplatbusProperties(bpy.types.PropertyGroup):
         max=30.0,
         step=1,
         precision=1,
+    )
+    timestamp_mode: EnumProperty(
+        name="Timestamp",
+        items=[
+            ('OFF', 'Off', "Don't sync timestamp"),
+            ('MANUAL', 'Manual', 'Use a fixed frame index'),
+            ('TIMELINE', 'Timeline', 'Sync with Blender timeline during playback'),
+        ],
+        default='OFF',
+        update=lambda self, ctx: _send_current_timestamp(),
+    )
+    timestamp_index: IntProperty(
+        name="Frame",
+        description="Frame index sent to the server in Manual mode",
+        default=0,
+        min=0,
+        max=100000,
+        update=lambda self, ctx: _send_current_timestamp(),
+    )
+    timestamp_min: IntProperty(
+        name="Min",
+        description="Timestamp value at the first frame of the timeline",
+        default=0,
+        min=0,
+        max=100000,
+        update=lambda self, ctx: _send_current_timestamp(),
+    )
+    timestamp_max: IntProperty(
+        name="Max",
+        description="Timestamp value at the last frame of the timeline",
+        default=100,
+        min=0,
+        max=100000,
+        update=lambda self, ctx: _send_current_timestamp(),
     )
     shadow_blur: IntProperty(
         name="Shadow blur",
@@ -571,8 +615,50 @@ def _send_pose(c2w=None, intrinsics=None):
             kwargs["intr_width"] = int(intrinsics["width"])
         if intrinsics.get("height") is not None:
             kwargs["intr_height"] = int(intrinsics["height"])
+    props = bpy.context.scene.splatbus_setup
+    mode = props.timestamp_mode
+    if mode == 'MANUAL':
+        kwargs["timestamp_index"] = props.timestamp_index
+    elif mode == 'TIMELINE':
+        scene = bpy.context.scene
+        frame = scene.frame_current
+        start = scene.frame_start
+        end = scene.frame_end
+        if end > start:
+            t = (frame - start) / (end - start)
+            ts = int(props.timestamp_min + t * (props.timestamp_max - props.timestamp_min))
+            kwargs["timestamp_index"] = ts
     _state.client.send_camera_pose(position=position, rotation=rotation, **kwargs)
     return True
+
+
+def _send_current_timestamp():
+    """Send the current timestamp value based on the active mode.
+
+    Called by property update callbacks so slider changes take effect
+    immediately without requiring camera movement.
+    """
+    if _state.client is None or not _state.client.connected:
+        return
+    props = bpy.context.scene.splatbus_setup
+    mode = props.timestamp_mode
+    ts = None
+    if mode == 'OFF':
+        # Send -1 to clear the server-side override and resume auto-increment.
+        _state.client.send_timestamp_index(-1)
+        return
+    elif mode == 'MANUAL':
+        ts = props.timestamp_index
+    elif mode == 'TIMELINE':
+        scene = bpy.context.scene
+        frame = scene.frame_current
+        start = scene.frame_start
+        end = scene.frame_end
+        if end > start:
+            t = (frame - start) / (end - start)
+            ts = int(props.timestamp_min + t * (props.timestamp_max - props.timestamp_min))
+    if ts is not None:
+        _state.client.send_timestamp_index(ts)
 
 
 def _receive_frames() -> dict:
@@ -781,13 +867,24 @@ def _tick():
                 gaussian_data = _state.client.receive_gaussians()
                 if gaussian_data is not None:
                     positions, colors = gaussian_data
+                    total = len(positions)
                     MAX_PC_POINTS = 100000
-                    if len(positions) > MAX_PC_POINTS:
-                        rng = np.random.default_rng()
-                        idx = rng.choice(len(positions), MAX_PC_POINTS, replace=False)
+                    if total > MAX_PC_POINTS and props.point_cloud_subsample:
+                        # Reuse cached sub-sample indices when the total
+                        # count is stable to prevent shimmering.
+                        if total == _state.pc_subsample_total and _state.pc_subsample_indices is not None:
+                            idx = _state.pc_subsample_indices
+                        else:
+                            rng = np.random.default_rng()
+                            idx = rng.choice(total, MAX_PC_POINTS, replace=False)
+                            _state.pc_subsample_total = total
+                            _state.pc_subsample_indices = idx
                         positions = positions[idx]
                         if colors is not None:
                             colors = colors[idx]
+                    elif total < MAX_PC_POINTS:
+                        _state.pc_subsample_total = 0
+                        _state.pc_subsample_indices = None
                     _update_point_cloud_in_place(positions, colors)
     except Exception:
         traceback.print_exc()
@@ -863,9 +960,12 @@ def _start():
         _setup_compositor()
         _state.compositor_ready = True
 
-    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_init):
-        if _on_frame_change not in h:
-            h.append(_on_frame_change)
+    if _on_render_init not in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.append(_on_render_init)
+    if _on_frame_change not in bpy.app.handlers.frame_change_pre:
+        bpy.app.handlers.frame_change_pre.append(_on_frame_change)
+    if _on_frame_change_timeline not in bpy.app.handlers.frame_change_pre:
+        bpy.app.handlers.frame_change_pre.append(_on_frame_change_timeline)
     if bpy.app.handlers.render_pre is not None:
         if _on_render_pre not in bpy.app.handlers.render_pre:
             bpy.app.handlers.render_pre.append(_on_render_pre)
@@ -898,6 +998,8 @@ def _stop():
     _state.gpu_texture = None
     _state.canonical_c2w = None
     _state.point_cloud_object = None
+    _state.last_camera_position = None
+    _state.last_camera_rotation = None
     _state.last_point_cloud_update = 0.0
 
     # Restore the render resolution we changed on connect.
@@ -914,11 +1016,18 @@ def _stop():
     except Exception:
         pass
 
-    for h in (bpy.app.handlers.frame_change_pre, bpy.app.handlers.render_init):
-        try:
-            h.remove(_on_frame_change)
-        except ValueError:
-            pass
+    try:
+        bpy.app.handlers.render_init.remove(_on_render_init)
+    except ValueError:
+        pass
+    try:
+        bpy.app.handlers.frame_change_pre.remove(_on_frame_change)
+    except ValueError:
+        pass
+    try:
+        bpy.app.handlers.frame_change_pre.remove(_on_frame_change_timeline)
+    except ValueError:
+        pass
     if bpy.app.handlers.render_pre is not None:
         try:
             bpy.app.handlers.render_pre.remove(_on_render_pre)
@@ -941,13 +1050,28 @@ def _on_render_pre(_scene=None):
         pass
 
 
-def _on_frame_change(_scene=None, _depsgraph=None):
+def _on_render_init(_scene=None, _depsgraph=None):
+    """Mark render start so _on_frame_change can distinguish render frame changes
+    from viewport playback frame changes."""
     if not _state.is_running:
         return
     props = bpy.context.scene.splatbus_setup
     if not props.in_use:
         return
     _state.is_rendering = True
+    _state.render_end_time = 0.0
+
+
+def _on_frame_change(_scene=None, _depsgraph=None):
+    if not _state.is_running:
+        return
+    props = bpy.context.scene.splatbus_setup
+    if not props.in_use:
+        return
+
+    # Only run during actual renders.  Viewport playback is handled by _tick.
+    if not _state.is_rendering or _state.render_end_time > 0:
+        return
 
     # NOTE: Do NOT modify object properties (hide_render etc.) here —
     # frame_change_pre runs inside depsgraph evaluation and mutating
@@ -981,6 +1105,34 @@ def _on_frame_change(_scene=None, _depsgraph=None):
                 scene.node_tree.update_tag()
         except Exception as refresh_err:
             print(f"[Splatbus] compositor refresh failed: {refresh_err}")
+    except Exception:
+        traceback.print_exc()
+
+
+def _on_frame_change_timeline(_scene=None, _depsgraph=None):
+    """Send current timeline timestamp to the server on each frame change.
+
+    Registered separately from _on_frame_change so it runs regardless of
+    the ``in_use`` toggle.  Only sends when timestamp_mode is TIMELINE.
+    Sends only the timestamp value, not the camera pose, so viewport
+    camera controls remain unaffected.
+    """
+    if not _state.is_running:
+        return
+    props = bpy.context.scene.splatbus_setup
+    if props.timestamp_mode != 'TIMELINE':
+        return
+    if _state.client is None or not _state.client.connected:
+        return
+    try:
+        scene = bpy.context.scene
+        frame = scene.frame_current
+        start = scene.frame_start
+        end = scene.frame_end
+        if end > start:
+            t = (frame - start) / (end - start)
+            ts = int(props.timestamp_min + t * (props.timestamp_max - props.timestamp_min))
+            _state.client.send_timestamp_index(ts)
     except Exception:
         traceback.print_exc()
 
@@ -1176,11 +1328,25 @@ def _update_point_cloud_in_place(positions: np.ndarray, colors: Optional[np.ndar
     if not isinstance(vp_pc, bpy.types.PointCloud) or not isinstance(render_pc, bpy.types.PointCloud):
         return _load_point_cloud(positions, colors)
 
-    if len(vp_pc.points) != n or len(render_pc.points) != n:
+    n_existing = len(vp_pc.points)
+    if n_existing == 0:
         return _load_point_cloud(positions, colors)
 
+    # Avoid blinking: when count changes, pad or truncate instead of
+    # recreating the objects (which causes a visible glitch).
+    if n != n_existing:
+        if n > n_existing:
+            positions = positions[:n_existing]
+            if colors is not None:
+                colors = colors[:n_existing]
+        else:
+            pad = n_existing - n
+            positions = np.pad(positions, ((0, pad), (0, 0)), mode='edge')
+            if colors is not None:
+                colors = np.pad(colors, ((0, pad), (0, 0)), mode='edge')
+        n = n_existing
+
     props = bpy.context.scene.splatbus_setup
-    scale = props.point_cloud_scale
     positions_scaled = positions.astype(np.float32)
 
     rgba = None
@@ -1696,6 +1862,9 @@ class SCENE_PT_splatbus(bpy.types.Panel):
         box.prop(props, "update_point_cloud")
         row = box.row()
         row.enabled = props.update_point_cloud
+        row.prop(props, "point_cloud_subsample")
+        row = box.row()
+        row.enabled = props.update_point_cloud
         row.prop(props, "point_cloud_fps", slider=True)
 
         col = layout.column()
@@ -1710,6 +1879,16 @@ class SCENE_PT_splatbus(bpy.types.Panel):
         else:
             box = layout.box()
             box.label(text=f"Streaming {_state.width}x{_state.height}", icon="RENDER_RESULT")
+            row = box.row()
+            row.prop(props, "timestamp_mode")
+            mode = props.timestamp_mode
+            if mode == 'MANUAL':
+                row = box.row()
+                row.prop(props, "timestamp_index", slider=True)
+            elif mode == 'TIMELINE':
+                row = box.row()
+                row.prop(props, "timestamp_min")
+                row.prop(props, "timestamp_max")
 
 
 # ===================== REGISTRATION =====================
