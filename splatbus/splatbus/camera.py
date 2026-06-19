@@ -202,6 +202,72 @@ class IPCCamera:
         )
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
+    def set_fov(self, fov_x: float, fov_y: float):
+        """Update the camera's field of view and recompute the projection matrix.
+
+        Handles both the center-shift (cx/cy/fl_x/fl_y) and plain FOV projection
+        variants.
+        """
+        self.fov_x = fov_x
+        self.fov_y = fov_y
+        if self.cx > 0 and self.fl_x > 0:
+            # Center-shift projection: update focal lengths, keep principal point.
+            self.fl_x = fov2focal(fov_x, self.image_width)
+            self.fl_y = fov2focal(fov_y, self.image_height)
+            self.projection_matrix = getProjectionMatrixCenterShift(
+                self.znear,
+                self.zfar,
+                self.cx,
+                self.cy,
+                self.fl_x,
+                self.fl_y,
+                self.image_width,
+                self.image_height,
+            ).transpose(0, 1)
+        else:
+            self.projection_matrix = getProjectionMatrix(
+                znear=self.znear, zfar=self.zfar, fovX=fov_x, fovY=fov_y
+            ).transpose(0, 1)
+        self.full_proj_transform = (
+            self.world_view_transform.unsqueeze(0).bmm(
+                self.projection_matrix.unsqueeze(0)
+            )
+        ).squeeze(0)
+
+    def set_intrinsics(self, fl_x: float, fl_y: float, cx: float, cy: float,
+                       width: int = None, height: int = None):
+        """Update the full pinhole intrinsics (focal length + principal point in pixels).
+
+        This mirrors the COLMAP PINHOLE camera model: w h fx fy cx cy.
+        Always uses the center-shift projection variant.
+        """
+        if width is not None:
+            self.image_width = width
+        if height is not None:
+            self.image_height = height
+        self.fl_x = fl_x
+        self.fl_y = fl_y
+        self.cx = cx
+        self.cy = cy
+        # Derive FOV for bookkeeping / downstream code that reads FoVx/FoVy.
+        self.fov_x = focal2fov(fl_x, self.image_width)
+        self.fov_y = focal2fov(fl_y, self.image_height)
+        self.projection_matrix = getProjectionMatrixCenterShift(
+            self.znear,
+            self.zfar,
+            self.cx,
+            self.cy,
+            self.fl_x,
+            self.fl_y,
+            self.image_width,
+            self.image_height,
+        ).transpose(0, 1)
+        self.full_proj_transform = (
+            self.world_view_transform.unsqueeze(0).bmm(
+                self.projection_matrix.unsqueeze(0)
+            )
+        ).squeeze(0)
+
     
     def cuda(self) -> "IPCCamera":
         cuda_copy = deepcopy(self)

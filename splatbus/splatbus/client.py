@@ -34,6 +34,9 @@ class GaussianSplattingIPCClient:
         self.client_buffer_evt = None      # Keep reference to prevent cleanup
         self.client_buffer_color = None
         self.client_buffer_depth = None
+        self.client_buffer_gaussians = None
+        self.client_buffer_evt_gaussian = None
+        self.gaussian_max_points = 0
         
         self.connected = False
         
@@ -150,6 +153,33 @@ class GaussianSplattingIPCClient:
                 self.client_buffer_depth = cb_depth
                 logger.info(f"[IPCClient] Depth buffer initialized with event sync (ipc_offset={offset})")
 
+        # Initialize Gaussian buffer with its own event
+        if "mem_gaussian" in payload:
+            gauss_evt_ptr = None
+            if "evt_gaussian" in payload:
+                cb_evt_gauss = ClientBuffer()
+                if cb_evt_gauss.open_event_handle(payload["evt_gaussian"]):
+                    gauss_evt_ptr = cb_evt_gauss.evt_ptr
+                    self.client_buffer_evt_gaussian = cb_evt_gauss
+                    logger.info(f"[IPCClient] Gaussian event handle opened: {hex(gauss_evt_ptr.value)}")
+
+            self.gaussian_max_points = meta.get("gaussian_max_points", 0)
+            gauss_w = meta.get("gaussian_channels", 7)
+            if self.gaussian_max_points > 0:
+                cb_gauss = ClientBuffer()
+                offset = meta.get("offsetGaussian", 0)
+                success = cb_gauss.open_mem_handle(
+                    payload["mem_gaussian"],
+                    width=gauss_w,
+                    height=self.gaussian_max_points,
+                    channels=1,
+                    offset=offset,
+                )
+                if success:
+                    cb_gauss.evt_ptr = gauss_evt_ptr
+                    self.client_buffer_gaussians = cb_gauss
+                    logger.info(f"[IPCClient] Gaussian buffer initialized: {self.gaussian_max_points} max points (ipc_offset={offset})")
+
     def receive(self) -> Dict[str, torch.Tensor]:
         """
         Receive latest frames from shared memory
@@ -215,19 +245,119 @@ class GaussianSplattingIPCClient:
             position = default_position
             rotation = default_rotation
         return np.array(position), np.array(rotation)
-        
-        
 
-    def send_camera_pose(self, position: Dict[str, float], rotation: Dict[str, float]):
+    def get_camera_info(self, cam_idx: int = 0) -> Optional[Tuple[float, float, int, int]]:
+        """
+        Request the server's camera intrinsics and image resolution.
+        Returns (fov_x, fov_y, width, height) or None on failure.
+        """
+        payload = {"type": "get_camera_info", "cam_idx": cam_idx}
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)
+        except Exception as e:
+            logger.warning(f"[IPCClient] get_camera_info request failed: {e}")
+            return None
+        if json_msg is None:
+            return None
+        try:
+            return (
+                float(json_msg.get("fov_x", 0.0)),
+                float(json_msg.get("fov_y", 0.0)),
+                int(json_msg.get("width", 0)),
+                int(json_msg.get("height", 0)),
+            )
+        except Exception as e:
+            logger.warning(f"[IPCClient] failed to decode camera info: {e}")
+            return None
+
+    def get_gaussians(self) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        """
+        Request the 3D Gaussian positions and colors from the server.
+        Returns a tuple (positions, colors) where positions is (N, 3) float32
+        and colors is (N, 3) float32 RGB or None if not provided.
+        """
+        import base64
+        payload = {"type": "get_gaussians"}
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)
+        except Exception as e:
+            logger.warning(f"[IPCClient] get_gaussians request failed: {e}")
+            return None
+        if json_msg is None:
+            return None
+        count = json_msg.get("count", 0)
+        positions_b64 = json_msg.get("positions", "")
+        colors_b64 = json_msg.get("colors", "")
+        if count == 0 or not positions_b64:
+            return None
+        try:
+            raw = base64.b64decode(positions_b64)
+            xyz = np.frombuffer(raw, dtype=np.float32).reshape(count, 3)
+            if colors_b64:
+                raw_color = base64.b64decode(colors_b64)
+                rgb = np.frombuffer(raw_color, dtype=np.float32).reshape(count, 3)
+            else:
+                rgb = None
+            return xyz, rgb
+        except Exception as e:
+            logger.warning(f"[IPCClient] failed to decode gaussians: {e}")
+            return None
+
+    def send_camera_pose(
+        self,
+        position: Dict[str, float],
+        rotation: Dict[str, float],
+        fov_x: float = None,
+        fov_y: float = None,
+        fl_x: float = None,
+        fl_y: float = None,
+        cx: float = None,
+        cy: float = None,
+        intr_width: int = None,
+        intr_height: int = None,
+        timestamp_index: int = None,
+    ):
         """
         Send camera pose
         position: {'x': float, 'y': float, 'z': float}
         rotation: {'x': float, 'y': float, 'z': float, 'w': float}
+        fov_x, fov_y: optional field-of-view (radians) to override the server default
+        fl_x, fl_y, cx, cy: optional pinhole intrinsics in pixels (COLMAP PINHOLE model)
+        intr_width, intr_height: resolution at which the intrinsics were computed
+        timestamp_index: optional frame index for 4DGS sync
         """
         payload = {
             "type": "camera_pose",
             "position": position,
             "rotation": rotation,
+        }
+        if fov_x is not None:
+            payload["fov_x"] = float(fov_x)
+        if fov_y is not None:
+            payload["fov_y"] = float(fov_y)
+        if fl_x is not None:
+            payload["fl_x"] = float(fl_x)
+        if fl_y is not None:
+            payload["fl_y"] = float(fl_y)
+        if cx is not None:
+            payload["cx"] = float(cx)
+        if cy is not None:
+            payload["cy"] = float(cy)
+        if intr_width is not None:
+            payload["intr_width"] = int(intr_width)
+        if intr_height is not None:
+            payload["intr_height"] = int(intr_height)
+        if timestamp_index is not None:
+            payload["timestamp_index"] = int(timestamp_index)
+        self._send_json(self.msg_sock, payload)
+
+    def send_timestamp_index(self, timestamp_index: int):
+        """Send a timestamp frame index to the server (lightweight, no camera pose)."""
+        payload = {
+            "type": "timestamp",
+            "timestamp_index": int(timestamp_index),
         }
         self._send_json(self.msg_sock, payload)
 
@@ -242,10 +372,41 @@ class GaussianSplattingIPCClient:
         }
         self._send_json(self.msg_sock, payload)
 
+    def receive_gaussians(self) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        """
+        Read gaussian positions and colors from the shared GPU buffer.
+        Returns (positions, colors) or None if not available.
+        """
+        if self.client_buffer_gaussians is None:
+            return None
+
+        try:
+            self.client_buffer_gaussians.read()
+        except Exception as e:
+            logger.warning(f"[IPCClient] receive_gaussians read failed: {e}")
+            return None
+
+        buf = self.client_buffer_gaussians.read_buffer  # (max_points, 7, 1)
+        if buf is None:
+            return None
+
+        valid = buf[..., 6, 0] > 0.5
+        n = valid.sum().item()
+        if n == 0:
+            return None
+
+        xyz = buf[valid, :3, 0].cpu().numpy().astype(np.float32)
+        rgb = buf[valid, 3:6, 0].cpu().numpy().astype(np.float32)
+        return xyz, rgb
+
     def close(self):
         self.connected = False
         self.stop_event.set()
         
+        if self.client_buffer_gaussians:
+            self.client_buffer_gaussians.close()
+        if self.client_buffer_evt_gaussian:
+            self.client_buffer_evt_gaussian.close()
         if self.client_buffer_color:
             self.client_buffer_color.close()
         if self.client_buffer_depth:

@@ -1,0 +1,7 @@
+/clients/Blender-client/.antigravitycli
+/clients/Blender-client/build
+/clients/Blender-client/dist
+/clients/Blender-client/prebuilt_wheels
+/clients/Blender-client/wheels
+/clients/Blender-client/splatbus-requirements.txt
+**/__pycache__
