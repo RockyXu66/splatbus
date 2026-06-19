@@ -571,7 +571,6 @@ def _send_pose(c2w=None, intrinsics=None):
             kwargs["intr_width"] = int(intrinsics["width"])
         if intrinsics.get("height") is not None:
             kwargs["intr_height"] = int(intrinsics["height"])
-        print(f"[Splatbus] sending intrinsics: fl_x={intrinsics.get('fl_x'):.2f}, fl_y={intrinsics.get('fl_y'):.2f}, cx={intrinsics.get('cx'):.2f}, cy={intrinsics.get('cy'):.2f}, w={intrinsics.get('width')}, h={intrinsics.get('height')}")
     _state.client.send_camera_pose(position=position, rotation=rotation, **kwargs)
     return True
 
@@ -610,7 +609,9 @@ def _safe_close_client(client):
         # Release torch tensors held by the buffers without invoking the buffer
         # ``close()`` methods that call cudaStreamDestroy / cudaIpcCloseMemHandle /
         # cudaEventDestroy.
-        for buf in (client.client_buffer_color, client.client_buffer_depth, client.client_buffer_evt):
+        for buf in (client.client_buffer_color, client.client_buffer_depth,
+                    client.client_buffer_evt, client.client_buffer_gaussians,
+                    client.client_buffer_evt_gaussian):
             if buf is not None:
                 buf.read_buffer = None
 
@@ -651,8 +652,6 @@ def _update_depth_image(depth_np: np.ndarray):
     flat[2::4] = depth_np.ravel()
     flat[3::4] = 1.0
     img.pixels.foreach_set(flat)
-    img.update()
-    img.update_tag()
     return img
 
 
@@ -697,8 +696,6 @@ def _update_blender_image(color_np: np.ndarray, alpha_mask: np.ndarray = None):
     else:
         flat[3::4] = np.maximum(np.maximum(color_np[..., 0], color_np[..., 1]), color_np[..., 2]).ravel()
     img.pixels.foreach_set(flat)
-    img.update()
-    img.update_tag()
     return img
 
 
@@ -781,13 +778,9 @@ def _tick():
             PC_UPDATE_INTERVAL = 1.0 / fps
             if now - _state.last_point_cloud_update >= PC_UPDATE_INTERVAL:
                 _state.last_point_cloud_update = now
-                gaussian_data = _state.client.get_gaussians()
+                gaussian_data = _state.client.receive_gaussians()
                 if gaussian_data is not None:
-                    if isinstance(gaussian_data, tuple):
-                        positions, colors = gaussian_data
-                    else:
-                        positions = gaussian_data
-                        colors = None
+                    positions, colors = gaussian_data
                     MAX_PC_POINTS = 100000
                     if len(positions) > MAX_PC_POINTS:
                         rng = np.random.default_rng()
@@ -962,7 +955,6 @@ def _on_frame_change(_scene=None, _depsgraph=None):
     # done exclusively in _on_render_pre which fires before evaluation.
 
     try:
-        print(f"[Splatbus] render/frame handler fired")
         c2w = _get_scene_camera_matrix()
         # Compute the render camera's intrinsics from the K matrix.
         cam = bpy.context.scene.camera
@@ -971,7 +963,6 @@ def _on_frame_change(_scene=None, _depsgraph=None):
         frames = _receive_frames()
         color = frames.get("color")
         depth = frames.get("depth")
-        print(f"[Splatbus] received frame: color={color is not None}, depth={depth is not None}, shape={color.shape if color is not None else None}")
         if color is not None:
             alpha_mask = None
             if depth is not None and depth.size > 0:
@@ -980,15 +971,8 @@ def _on_frame_change(_scene=None, _depsgraph=None):
             # The image pixels changed; invalidate the viewport GPU texture so
             # it is rebuilt safely in the next draw handler call.
             _state.gpu_texture = None
-            print(f"[Splatbus] updated color image: {img}, size={img.size if img else None}")
-            print(f"[Splatbus] color shape: {color.shape}, dtype: {color.dtype}")
-            print(f"[Splatbus] RGB mean: {color[..., :3].mean():.4f}, alpha mean: {alpha_mask.mean() if alpha_mask is not None else -1:.4f}")
-            if color.shape[2] == 4:
-                alpha = color[..., 3]
-                print(f"[Splatbus] server alpha stats: min={alpha.min():.4f}, max={alpha.max():.4f}, nonzero={np.count_nonzero(alpha)}")
         if depth is not None:
             _update_depth_image(depth)
-            print(f"[Splatbus] depth min={depth.min():.4f} max={depth.max():.4f}")
 
         # ── Notify the compositor that the image datablocks changed ──
         try:
@@ -1208,10 +1192,7 @@ def _update_point_cloud_in_place(positions: np.ndarray, colors: Optional[np.ndar
         pc.points.foreach_set("co", positions_scaled.ravel())
         if rgba is not None and "Col" in pc.attributes:
             pc.attributes["Col"].data.foreach_set("color", rgba.ravel())
-        pc.update()
 
-    vp_obj.scale = (scale,) * 3
-    render_obj.scale = (scale,) * 3
     _state.point_cloud_object = vp_obj
     return vp_obj
 

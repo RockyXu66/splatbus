@@ -85,12 +85,13 @@ class SharedBuffer:
         elif self.channels == 1:
             format = 'R32F'
         else:
-            raise ValueError(f"Invalid number of channels: {self.channels}")
+            format = f'FLOAT32x{self.channels}'
         return {
             'width': self.width,
             'height': self.height,
             'pitch': self.pitch,
             'format': format,
+            'channels': self.channels,
             'ipc_offset': self.ipc_offset,
         }
         

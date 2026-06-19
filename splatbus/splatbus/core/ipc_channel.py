@@ -28,6 +28,7 @@ class IPCSocketServer(BaseSocketServer):
         depth_buffer_info: dict,
         ipc_handles_info: dict,
         device: Optional[int] = None,
+        gaussian_buffer_info: Optional[dict] = None,
     ):
 
         meta = {
@@ -52,6 +53,14 @@ class IPCSocketServer(BaseSocketServer):
             "mem_depth": base64.b64encode(bytes(ipc_handles_info['mem_handle_depth'])).decode('utf-8'),
             "evt_done": base64.b64encode(bytes(ipc_handles_info['evt_handle'])).decode('utf-8')
         }
+
+        if gaussian_buffer_info is not None and 'mem_handle_gaussian' in ipc_handles_info:
+            meta["fmtGaussian"] = gaussian_buffer_info['format']
+            meta["offsetGaussian"] = int(gaussian_buffer_info.get('ipc_offset', 0))
+            meta["gaussian_max_points"] = int(gaussian_buffer_info['height'])
+            meta["gaussian_channels"] = int(gaussian_buffer_info['width'])
+            init_packet["mem_gaussian"] = base64.b64encode(bytes(ipc_handles_info['mem_handle_gaussian'])).decode('utf-8')
+            init_packet["evt_gaussian"] = base64.b64encode(bytes(ipc_handles_info['evt_handle_gaussian'])).decode('utf-8')
 
         self._init_payload = init_packet
 

@@ -34,6 +34,9 @@ class GaussianSplattingIPCClient:
         self.client_buffer_evt = None      # Keep reference to prevent cleanup
         self.client_buffer_color = None
         self.client_buffer_depth = None
+        self.client_buffer_gaussians = None
+        self.client_buffer_evt_gaussian = None
+        self.gaussian_max_points = 0
         
         self.connected = False
         
@@ -149,6 +152,33 @@ class GaussianSplattingIPCClient:
                 cb_depth.evt_ptr = evt_ptr  # Share the event
                 self.client_buffer_depth = cb_depth
                 logger.info(f"[IPCClient] Depth buffer initialized with event sync (ipc_offset={offset})")
+
+        # Initialize Gaussian buffer with its own event
+        if "mem_gaussian" in payload:
+            gauss_evt_ptr = None
+            if "evt_gaussian" in payload:
+                cb_evt_gauss = ClientBuffer()
+                if cb_evt_gauss.open_event_handle(payload["evt_gaussian"]):
+                    gauss_evt_ptr = cb_evt_gauss.evt_ptr
+                    self.client_buffer_evt_gaussian = cb_evt_gauss
+                    logger.info(f"[IPCClient] Gaussian event handle opened: {hex(gauss_evt_ptr.value)}")
+
+            self.gaussian_max_points = meta.get("gaussian_max_points", 0)
+            gauss_w = meta.get("gaussian_channels", 7)
+            if self.gaussian_max_points > 0:
+                cb_gauss = ClientBuffer()
+                offset = meta.get("offsetGaussian", 0)
+                success = cb_gauss.open_mem_handle(
+                    payload["mem_gaussian"],
+                    width=gauss_w,
+                    height=self.gaussian_max_points,
+                    channels=1,
+                    offset=offset,
+                )
+                if success:
+                    cb_gauss.evt_ptr = gauss_evt_ptr
+                    self.client_buffer_gaussians = cb_gauss
+                    logger.info(f"[IPCClient] Gaussian buffer initialized: {self.gaussian_max_points} max points (ipc_offset={offset})")
 
     def receive(self) -> Dict[str, torch.Tensor]:
         """
@@ -330,10 +360,41 @@ class GaussianSplattingIPCClient:
         }
         self._send_json(self.msg_sock, payload)
 
+    def receive_gaussians(self) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+        """
+        Read gaussian positions and colors from the shared GPU buffer.
+        Returns (positions, colors) or None if not available.
+        """
+        if self.client_buffer_gaussians is None:
+            return None
+
+        try:
+            self.client_buffer_gaussians.read()
+        except Exception as e:
+            logger.warning(f"[IPCClient] receive_gaussians read failed: {e}")
+            return None
+
+        buf = self.client_buffer_gaussians.read_buffer  # (max_points, 7, 1)
+        if buf is None:
+            return None
+
+        valid = buf[..., 6, 0] > 0.5
+        n = valid.sum().item()
+        if n == 0:
+            return None
+
+        xyz = buf[valid, :3, 0].cpu().numpy().astype(np.float32)
+        rgb = buf[valid, 3:6, 0].cpu().numpy().astype(np.float32)
+        return xyz, rgb
+
     def close(self):
         self.connected = False
         self.stop_event.set()
         
+        if self.client_buffer_gaussians:
+            self.client_buffer_gaussians.close()
+        if self.client_buffer_evt_gaussian:
+            self.client_buffer_evt_gaussian.close()
         if self.client_buffer_color:
             self.client_buffer_color.close()
         if self.client_buffer_depth:

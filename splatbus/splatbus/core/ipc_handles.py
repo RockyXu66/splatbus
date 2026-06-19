@@ -7,16 +7,23 @@ from loguru import logger
 class IPCHandleManager:
     """ Manage IPC handles """
 
-    def __init__(self, color_buffer: SharedBuffer, depth_buffer: SharedBuffer) -> None:
+    def __init__(self, color_buffer: SharedBuffer, depth_buffer: SharedBuffer,
+                 gaussian_buffer: SharedBuffer = None) -> None:
 
         self.color_buffer: SharedBuffer = color_buffer
         self.depth_buffer: SharedBuffer = depth_buffer
+        self.gaussian_buffer: SharedBuffer = gaussian_buffer
 
         self.cuda = load_cuda_runtime()
 
         self.mem_handle_color = self._create_memory_handle(self.color_buffer)
         self.mem_handle_depth = self._create_memory_handle(self.depth_buffer)
         self.evt_handle, self.evt_ptr = self._create_event_handle()
+
+        self.gaussian_initialized = gaussian_buffer is not None
+        if self.gaussian_initialized:
+            self.mem_handle_gaussian = self._create_memory_handle(self.gaussian_buffer)
+            self.evt_handle_gaussian, self.evt_ptr_gaussian = self._create_event_handle()
 
     def _create_memory_handle(self, buffer: SharedBuffer) -> IpcMem:
         """ Create memory handle """
@@ -93,11 +100,20 @@ class IPCHandleManager:
         # Record event on default stream to signal completion
         self.cuda.cudaEventRecord(self.evt_ptr, ctypes.c_void_p(0))  # stream = 0 (default)
     
+    def record_gaussian_event(self):
+        """Record event to signal that gaussian buffer is ready to read."""
+        torch.cuda.synchronize()
+        self.cuda.cudaEventRecord(self.evt_ptr_gaussian, ctypes.c_void_p(0))
+
     def get_handle(self):
         """ Get all handles """
 
-        return {
+        result = {
             'mem_handle_color': bytes(self.mem_handle_color.raw),
             'mem_handle_depth': bytes(self.mem_handle_depth.raw),
             'evt_handle': bytes(self.evt_handle.raw),
         }
+        if self.gaussian_initialized:
+            result['mem_handle_gaussian'] = bytes(self.mem_handle_gaussian.raw)
+            result['evt_handle_gaussian'] = bytes(self.evt_handle_gaussian.raw)
+        return result
