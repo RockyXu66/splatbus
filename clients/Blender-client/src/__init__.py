@@ -79,6 +79,8 @@ class _SplatbusState:
     last_camera_position: Optional[np.ndarray] = None
     last_camera_rotation: Optional[np.ndarray] = None
 
+    last_point_cloud_update: float = 0.0
+
 _state = _SplatbusState()
 
 
@@ -727,9 +729,9 @@ def _tick():
         vp_rv3d = _get_active_viewport_rv3d()
         vp_intrinsics = _compute_camera_intrinsics(rv3d=vp_rv3d)
 
-        # Skip server updates when the viewport camera has not moved and FOV
-        # is unchanged.  This eliminates jitter caused by re-uploading
-        # identical/oscillating frames every tick when the view is static.
+        # Only send the camera pose to the server when the viewport camera has
+        # actually moved.  Always poll for new frames so 4DGS (or any autonomous
+        # server) can push updates without camera motion.
         pos = c2w[:3, 3]
         rot = c2w[:3, :3]
         last_pos = _state.last_camera_position
@@ -744,17 +746,39 @@ def _tick():
             _state.last_camera_position = pos.copy()
             _state.last_camera_rotation = rot.copy()
             _send_pose(c2w, intrinsics=vp_intrinsics)
-            frames = _receive_frames()
-            if frames:
-                color = frames.get("color")
-                depth = frames.get("depth")
-                if color is not None:
-                    if _state.is_rendering:
-                        _update_blender_image(color, alpha_mask=(depth < 99.9).astype(np.float32) if depth is not None else None)
-                    else:
-                        _update_compositor_image(color, depth)
-                if depth is not None:
-                    _update_depth_image(depth)
+
+        frames = _receive_frames()
+        if frames:
+            color = frames.get("color")
+            depth = frames.get("depth")
+            if color is not None:
+                if _state.is_rendering:
+                    _update_blender_image(color, alpha_mask=(depth < 99.9).astype(np.float32) if depth is not None else None)
+                else:
+                    _update_compositor_image(color, depth)
+            if depth is not None:
+                _update_depth_image(depth)
+
+        # Periodically update the point cloud from the server.
+        now = time.time()
+        PC_UPDATE_INTERVAL = 1.0 / 15.0
+        if now - _state.last_point_cloud_update >= PC_UPDATE_INTERVAL:
+            _state.last_point_cloud_update = now
+            gaussian_data = _state.client.get_gaussians()
+            if gaussian_data is not None:
+                if isinstance(gaussian_data, tuple):
+                    positions, colors = gaussian_data
+                else:
+                    positions = gaussian_data
+                    colors = None
+                MAX_PC_POINTS = 100000
+                if len(positions) > MAX_PC_POINTS:
+                    rng = np.random.default_rng()
+                    idx = rng.choice(len(positions), MAX_PC_POINTS, replace=False)
+                    positions = positions[idx]
+                    if colors is not None:
+                        colors = colors[idx]
+                _load_point_cloud(positions, colors)
     except Exception:
         traceback.print_exc()
 
@@ -864,6 +888,7 @@ def _stop():
     _state.gpu_texture = None
     _state.canonical_c2w = None
     _state.point_cloud_object = None
+    _state.last_point_cloud_update = 0.0
 
     # Restore the render resolution we changed on connect.
     try:
