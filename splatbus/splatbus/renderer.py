@@ -88,6 +88,9 @@ class GaussianSplattingIPCRenderer:
     def update_gaussians(self, gaussians):
         self.msg_server.update_gaussians(gaussians)
 
+    def update_rgb_points(self, xyz, rgb):
+        self.msg_server.update_rgb_points(xyz, rgb)
+
     def close(self):
         self.ipc_server.close_socket()
         self.msg_server.close_socket()

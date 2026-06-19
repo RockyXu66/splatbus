@@ -239,6 +239,20 @@ class SplatbusProperties(bpy.types.PropertyGroup):
         precision=3,
         update=_update_point_cloud_scale,
     )
+    update_point_cloud: BoolProperty(
+        name="Live point cloud",
+        description="Periodically refresh point cloud from the server. Disable if too slow.",
+        default=True,
+    )
+    point_cloud_fps: FloatProperty(
+        name="PC refresh rate",
+        description="How many times per second to refresh the point cloud from the server",
+        default=5.0,
+        min=0.5,
+        max=30.0,
+        step=1,
+        precision=1,
+    )
     shadow_blur: IntProperty(
         name="Shadow blur",
         description="Pixel blur applied only to the Cycles shadow-catcher pass to hide point receiver footprints",
@@ -760,25 +774,28 @@ def _tick():
                 _update_depth_image(depth)
 
         # Periodically update the point cloud from the server.
-        now = time.time()
-        PC_UPDATE_INTERVAL = 1.0 / 15.0
-        if now - _state.last_point_cloud_update >= PC_UPDATE_INTERVAL:
-            _state.last_point_cloud_update = now
-            gaussian_data = _state.client.get_gaussians()
-            if gaussian_data is not None:
-                if isinstance(gaussian_data, tuple):
-                    positions, colors = gaussian_data
-                else:
-                    positions = gaussian_data
-                    colors = None
-                MAX_PC_POINTS = 100000
-                if len(positions) > MAX_PC_POINTS:
-                    rng = np.random.default_rng()
-                    idx = rng.choice(len(positions), MAX_PC_POINTS, replace=False)
-                    positions = positions[idx]
-                    if colors is not None:
-                        colors = colors[idx]
-                _load_point_cloud(positions, colors)
+        props = bpy.context.scene.splatbus_setup
+        if props.update_point_cloud:
+            now = time.time()
+            fps = max(props.point_cloud_fps, 0.1)
+            PC_UPDATE_INTERVAL = 1.0 / fps
+            if now - _state.last_point_cloud_update >= PC_UPDATE_INTERVAL:
+                _state.last_point_cloud_update = now
+                gaussian_data = _state.client.get_gaussians()
+                if gaussian_data is not None:
+                    if isinstance(gaussian_data, tuple):
+                        positions, colors = gaussian_data
+                    else:
+                        positions = gaussian_data
+                        colors = None
+                    MAX_PC_POINTS = 100000
+                    if len(positions) > MAX_PC_POINTS:
+                        rng = np.random.default_rng()
+                        idx = rng.choice(len(positions), MAX_PC_POINTS, replace=False)
+                        positions = positions[idx]
+                        if colors is not None:
+                            colors = colors[idx]
+                    _update_point_cloud_in_place(positions, colors)
     except Exception:
         traceback.print_exc()
 
@@ -1022,14 +1039,24 @@ def _create_point_cloud_object(name, positions, rgba, radius=None):
 
     obj = bpy.data.objects.new(name, mesh)
     bpy.context.collection.objects.link(obj)
-    bpy.context.view_layer.objects.active = obj
-    for o in bpy.context.selected_objects:
+
+    # Save selection state so the conversion operator does not disturb the user.
+    prev_active = bpy.context.view_layer.objects.active
+    prev_selected = list(bpy.context.selected_objects)
+    for o in prev_selected:
         o.select_set(False)
     obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
     try:
         bpy.ops.object.convert(target='POINTCLOUD')
     except Exception as conv_err:
         print(f"[Splatbus] point-cloud conversion failed for {name}: {conv_err}")
+    # Restore previous selection state.
+    bpy.context.view_layer.objects.active = prev_active
+    for o in prev_selected:
+        o.select_set(True)
+    obj.select_set(False)
+
     pc = obj.data
     if "Col" in pc.attributes:
         pc.attributes.active = pc.attributes["Col"]
@@ -1083,6 +1110,7 @@ def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None
         if colors is not None and colors.shape == (n, 3):
             print(f"[Splatbus] creating Col attribute from colors {colors.shape}, range [{colors.min():.3f}, {colors.max():.3f}]")
             base_rgba = np.concatenate([colors.astype(np.float32), np.ones((n, 1), dtype=np.float32)], axis=1)
+            base_rgba = np.clip(base_rgba, 0.0, 1.0)
         else:
             print(f"[Splatbus] no valid colors supplied (colors={colors}), using white Col attribute")
             base_rgba = np.ones((n, 4), dtype=np.float32)
@@ -1146,6 +1174,46 @@ def _load_point_cloud(positions: np.ndarray, colors: Optional[np.ndarray] = None
         print(f"[Splatbus] failed to load point cloud: {e}")
         traceback.print_exc()
         return None
+
+
+def _update_point_cloud_in_place(positions: np.ndarray, colors: Optional[np.ndarray] = None):
+    """Update the existing point cloud objects in-place (no object recreation)."""
+    n = len(positions)
+    if colors is not None and colors.shape != (n, 3):
+        colors = None
+
+    vp_obj = bpy.data.objects.get("SplatbusPointCloud")
+    render_obj = bpy.data.objects.get("SplatbusPointCloudRender")
+    if vp_obj is None or render_obj is None:
+        return _load_point_cloud(positions, colors)
+
+    vp_pc = vp_obj.data
+    render_pc = render_obj.data
+    if not isinstance(vp_pc, bpy.types.PointCloud) or not isinstance(render_pc, bpy.types.PointCloud):
+        return _load_point_cloud(positions, colors)
+
+    if len(vp_pc.points) != n or len(render_pc.points) != n:
+        return _load_point_cloud(positions, colors)
+
+    props = bpy.context.scene.splatbus_setup
+    scale = props.point_cloud_scale
+    positions_scaled = positions.astype(np.float32)
+
+    rgba = None
+    if colors is not None:
+        rgba = np.concatenate([colors.astype(np.float32), np.ones((n, 1), dtype=np.float32)], axis=1)
+        rgba = np.clip(rgba, 0.0, 1.0)
+
+    for pc in (vp_pc, render_pc):
+        pc.points.foreach_set("co", positions_scaled.ravel())
+        if rgba is not None and "Col" in pc.attributes:
+            pc.attributes["Col"].data.foreach_set("color", rgba.ravel())
+        pc.update()
+
+    vp_obj.scale = (scale,) * 3
+    render_obj.scale = (scale,) * 3
+    _state.point_cloud_object = vp_obj
+    return vp_obj
 
 
 # ===================== COMPOSITOR =====================
@@ -1644,6 +1712,10 @@ class SCENE_PT_splatbus(bpy.types.Panel):
         box.prop(props, "render_point_cloud")
         box.prop(props, "point_cloud_size")
         box.prop(props, "point_cloud_scale")
+        box.prop(props, "update_point_cloud")
+        row = box.row()
+        row.enabled = props.update_point_cloud
+        row.prop(props, "point_cloud_fps", slider=True)
 
         col = layout.column()
         col.enabled = _state.is_running

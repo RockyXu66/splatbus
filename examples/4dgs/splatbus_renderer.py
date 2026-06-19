@@ -9,13 +9,14 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import os
 import sys
+import time
 from argparse import ArgumentParser
-from os import makedirs
+from contextlib import suppress
 
+import splatbus
 import torch
-import torchvision
+from loguru import logger
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from tqdm import tqdm
@@ -24,79 +25,61 @@ from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import GaussianModel, render
 from scene import Scene
 from utils.general_utils import safe_state
-
-from loguru import logger
-import time
-import splatbus
-from contextlib import suppress
+from utils.sh_utils import eval_sh, eval_shfs_4d
 
 # width = 532; height = 948
-width = 1600; height = 900
+width = 1600
+height = 900
+
 
 def print_view(view):
-    if hasattr(view, 'FoVx'):
-        logger.info(f'FoVx: {view.FoVx}')
+    if hasattr(view, "FoVx"):
+        logger.info(f"FoVx: {view.FoVx}")
     else:
-        logger.info(f'FoVx: None')
-    if hasattr(view, 'FoVy'):
-        logger.info(f'FoVy: {view.FoVy}')
+        logger.info("FoVx: None")
+    if hasattr(view, "FoVy"):
+        logger.info(f"FoVy: {view.FoVy}")
     else:
-        logger.info(f'FoVy: None')
-    if hasattr(view, 'camera_center'):
-        logger.info(f'Camera Center: {view.camera_center}')
+        logger.info("FoVy: None")
+    if hasattr(view, "camera_center"):
+        logger.info(f"Camera Center: {view.camera_center}")
     else:
-        logger.info(f'Camera Center: None')
-    if hasattr(view, 'R'):
-        logger.info(f'R: \n{view.R}')
+        logger.info("Camera Center: None")
+    if hasattr(view, "R"):
+        logger.info(f"R: \n{view.R}")
     else:
-        logger.info(f'R: None')
-    if hasattr(view, 'T'):
-        logger.info(f'T: \n{view.T}')
+        logger.info("R: None")
+    if hasattr(view, "T"):
+        logger.info(f"T: \n{view.T}")
     else:
-        logger.info(f'T: None')
-    if hasattr(view, 'full_proj_transform'):
-        logger.info(f'Full proj: \n{view.full_proj_transform}')
+        logger.info("T: None")
+    if hasattr(view, "full_proj_transform"):
+        logger.info(f"Full proj: \n{view.full_proj_transform}")
     else:
-        logger.info(f'Full proj: None')
-    if hasattr(view, 'projection_matrix'):
-        logger.info(f'Proj max: \n{view.projection_matrix}')
+        logger.info("Full proj: None")
+    if hasattr(view, "projection_matrix"):
+        logger.info(f"Proj max: \n{view.projection_matrix}")
     else:
-        logger.info(f'Proj max: None')
-    if hasattr(view, 'world_view_transform'):
-        logger.info(f'world view transform: \n{view.world_view_transform}')
+        logger.info("Proj max: None")
+    if hasattr(view, "world_view_transform"):
+        logger.info(f"world view transform: \n{view.world_view_transform}")
     else:
-        logger.info(f'world view transform: None')
+        logger.info("world view transform: None")
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
 
-    makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        rendering = render(view[1].cuda(), gaussians, pipeline, background)["render"]
-        gt = view[0][0:3, :, :]
-        torchvision.utils.save_image(
-            rendering, os.path.join(render_path, "{0:05d}".format(idx) + ".png")
-        )
-        torchvision.utils.save_image(
-            gt, os.path.join(gts_path, "{0:05d}".format(idx) + ".png")
-        )
-
-def loop_render(model_path, name, iteration, views, gaussians, pipeline, background, fps, time_duration):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-
-    makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-
+def loop_render(
+    views,
+    gaussians,
+    pipeline,
+    background,
+    fps,
+    time_duration,
+    live_update_pts,
+):
     idx = 0
-
     target_frame_time = 1.0 / fps
-
     ipc_render = splatbus.GaussianSplattingIPCRenderer(
-        width=width, 
+        width=width,
         height=height,
         ipc_host="0.0.0.0",
         ipc_port=6001,
@@ -112,29 +95,49 @@ def loop_render(model_path, name, iteration, views, gaussians, pipeline, backgro
     t_start, t_end = time_duration
     num_frames = len(views)
     frame_count = 0
+    ipc_render.update_gaussians(gaussians)
 
     try:
         while True:
             loop_start_time = time.time()
 
             view: splatbus.IPCCamera = ipc_render.get_current_view().cuda()
-            view.timestamp = t_start + (frame_count % num_frames) / num_frames * (t_end - t_start)
+            view.timestamp = t_start + (frame_count % num_frames) / num_frames * (
+                t_end - t_start
+            )
             frame_count += 1
-            # print_view(view)
-
+            if live_update_pts:
+                _, delta_mean = gaussians.get_current_covariance_and_mean_offset(
+                    1, view.timestamp
+                )
+                marginal_t = gaussians.get_marginal_t(view.timestamp)
+                means3D = gaussians.get_xyz + delta_mean
+                shs_view = gaussians.get_features.transpose(1, 2).view(
+                    -1, 3, gaussians.get_max_sh_channels
+                )
+                dir_pp = (
+                    means3D - view.camera_center.repeat(gaussians.get_features.shape[0], 1)
+                ).detach()
+                dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+                dir_t = (gaussians.get_t - view.timestamp).detach()
+                sh2rgb = eval_shfs_4d(
+                    gaussians.active_sh_degree,
+                    gaussians.active_sh_degree_t,
+                    shs_view,
+                    dir_pp_normalized,
+                    dir_t,
+                    t_end - t_start,
+                )
+                # sh2rgb = eval_sh(gaussians.active_sh_degree, shs_view, dir_pp_normalized)
+                colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+                mask = marginal_t[:, 0] > 0.05
+                xyz, rgb = means3D[mask], colors_precomp[mask]
+                ipc_render.update_rgb_points(xyz.detach(), rgb.detach())
             rendering = render(view, gaussians, pipeline, background)
-            # gt = view[0][0:3, :, :]
-            # torchvision.utils.save_image(
-            #     gt, os.path.join(gts_path, "{0:05d}".format(idx) + ".png")
-            # )
 
             # Update IPC buffers
             depth_data = rendering["depth"]
             rendering_data = rendering["render"]
-
-            # torchvision.utils.save_image(
-            #     rendering_data, os.path.join(render_path, "{0:05d}".format(idx) + ".png")
-            # )
 
             # TODO: Accept channels=3. For now we'll padd alpha to 1:
             # if rendering_data.shape[0] == 3:
@@ -150,39 +153,33 @@ def loop_render(model_path, name, iteration, views, gaussians, pipeline, backgro
                 time.sleep(sleep_time)
 
             pbar.update(1)
-            
-
-        ipc_render.close()
-            
     except KeyboardInterrupt:
         logger.info("\n\n Stopping render loop... \n\n")
     except Exception:
         logger.exception("\n\n ERROR in render loop")
         raise
     finally:
-        # pbar.close()
+        pbar.close()
         with suppress(Exception):
             ipc_render.close()
 
 
-def render_sets(
+def main(
     dataset: ModelParams,
-    iteration: int,
     pipeline: PipelineParams,
-    skip_train: bool,
-    skip_test: bool,
     time_duration,
     gaussian_dim,
     rot_4d,
     force_sh_3d,
     fps,
+    live_update_pts,
 ):
     with torch.no_grad():
         gaussians = GaussianModel(
             dataset.sh_degree,
-            gaussian_dim=4,
+            gaussian_dim=gaussian_dim,
             time_duration=time_duration,
-            rot_4d=True,
+            rot_4d=rot_4d,
             force_sh_3d=force_sh_3d,
             sh_degree_t=2 if pipeline.eval_shfs_4d else 0,
         )
@@ -198,47 +195,17 @@ def render_sets(
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        if not skip_train:
-            render_set(
-                dataset.model_path,
-                "train",
-                scene.loaded_iter,
-                scene.getTrainCameras(),
-                gaussians,
-                pipeline,
-                background,
-            )
-
-        if not skip_test:
-            loop_render(
-                dataset.model_path,
-                "test",
-                scene.loaded_iter,
-                scene.getTestCameras(),
-                gaussians,
-                pipeline,
-                background,
-                fps,
-                time_duration,
-            )
+        loop_render(
+            scene.getTestCameras(),
+            gaussians,
+            pipeline,
+            background,
+            fps,
+            time_duration,
+            live_update_pts,
+        )
 
 
-# if __name__ == "__main__":
-#    # Set up command line argument parser
-#    parser = ArgumentParser(description="Testing script parameters")
-#    model = ModelParams(parser, sentinel=True)
-#    pipeline = PipelineParams(parser)
-#    parser.add_argument("--iteration", default=-1, type=int)
-#    parser.add_argument("--skip_train", action="store_true")
-#    parser.add_argument("--skip_test", action="store_true")
-#    parser.add_argument("--quiet", action="store_true")
-#    args = get_combined_args(parser)
-#    print("Rendering " + args.model_path)
-#
-#    # Initialize system state (RNG)
-#    safe_state(args.quiet)
-#
-#
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
@@ -252,10 +219,10 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--3DGS", dest="use_3dgs", action="store_true")
     parser.add_argument("--gaussian_dim", type=int, default=3)
-    parser.add_argument("--time_duration", nargs=2, type=float, default=[-0.5, 0.5])
+    parser.add_argument("--time_duration", nargs=2, type=float, default=[0, 10])
     parser.add_argument("--num_pts", type=int, default=100_000)
     parser.add_argument("--num_pts_ratio", type=float, default=1.0)
-    parser.add_argument("--rot_4d", action="store_true")
+    parser.add_argument("--rot_4d", action="store_true", default=True)
     parser.add_argument("--force_sh_3d", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=6666)
@@ -263,6 +230,7 @@ if __name__ == "__main__":
     parser.add_argument("--spherical_coords", action="store_true")
     parser.add_argument("--max-frames", type=int, required=False)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--live-update-pts", action="store_true", help="Whether to update RGB point cloud at every frame for SplatBus.")
     args = parser.parse_args(sys.argv[1:])
     # args.save_iterations.append(args.iterations)
 
@@ -291,15 +259,13 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(
+    main(
         model.extract(args),
-        args.iteration,
         pipeline.extract(args),
-        args.skip_train,
-        args.skip_test,
         args.time_duration,
         args.gaussian_dim,
         args.rot_4d,
         args.force_sh_3d,
         args.fps,
+        args.live_update_pts,
     )

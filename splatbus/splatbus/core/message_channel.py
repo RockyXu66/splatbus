@@ -187,6 +187,14 @@ class MessageSocketServer(BaseSocketServer):
         else:
             self.gaussians_color = None
 
+    def update_rgb_points(self, xyz, rgb):
+        if isinstance(xyz, np.ndarray):
+            xyz = torch.from_numpy(xyz).float()
+        if isinstance(rgb, np.ndarray):
+            rgb = torch.from_numpy(rgb).float()
+        self.gaussians_xyz = xyz.detach().clone()
+        self.gaussians_color = rgb.detach().clone() if rgb is not None else None
+
     def _handle_payload(self, payload: dict):
         if payload.get("type") == "camera_pose":
             self._cam_pose = payload
@@ -228,13 +236,15 @@ class MessageSocketServer(BaseSocketServer):
                 "height": height,
             })
         elif payload.get("type") == "get_gaussians":
-            if self.gaussians_xyz is None:
+            gaussians_xyz = self.gaussians_xyz
+            gaussians_color = self.gaussians_color
+            if gaussians_xyz is None:
                 self.send_message({"count": 0, "positions": "", "colors": ""})
             else:
-                xyz = self.gaussians_xyz.cpu().numpy().astype(np.float32)
+                xyz = gaussians_xyz.cpu().numpy().astype(np.float32)
                 positions_b64 = base64.b64encode(xyz.tobytes()).decode("utf-8")
-                if self.gaussians_color is not None:
-                    rgb = self.gaussians_color.cpu().numpy().astype(np.float32)
+                if gaussians_color is not None:
+                    rgb = gaussians_color.cpu().numpy().astype(np.float32)
                     colors_b64 = base64.b64encode(rgb.tobytes()).decode("utf-8")
                 else:
                     colors_b64 = ""
