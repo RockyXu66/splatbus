@@ -13,7 +13,7 @@ import sys
 import json
 import math
 import time
-import argparse
+from typing import Literal, Optional
 
 GS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "..", "examples", "gaussian-splatting"))
@@ -22,6 +22,8 @@ sys.path.insert(0, GS_DIR)
 import numpy as np
 import torch
 from loguru import logger
+import typer
+app = typer.Typer()
 
 from scene.gaussian_model import GaussianModel
 from gaussian_renderer import render
@@ -65,45 +67,55 @@ def load_cams(path, width, height):
         out.append(SimpleCam(R.astype(np.float32), t.astype(np.float32), fovx, fovy))
     return out
 
+@app.command()
+def main(
+    model: str = typer.Option(..., "--model"),
+    cameras: Optional[str] = typer.Option(None, "--cameras"),
+    iteration: int = typer.Option(30000, "--iteration"),
+    sh_degree: int = typer.Option(3, "--sh-degree"),
+    width: int = typer.Option(1920, "--width"),
+    height: int = typer.Option(1080, "--height"),
+    fps: int = typer.Option(1000, "--fps"),
+    ipc_port: int = typer.Option(6001, "--ipc-port"),
+    msg_port: int = typer.Option(6000, "--msg-port"),
+    orbit: bool = typer.Option(False, "--orbit"),
+    handoff_mode: Literal["CUDA-IPC", "encoded-stream", "CPU-shared-memory"] = typer.Option("CUDA-IPC", "--handoff-mode"),
+):
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--cameras", default=None)
-    ap.add_argument("--iteration", type=int, default=30000)
-    ap.add_argument("--sh-degree", type=int, default=3)
-    ap.add_argument("--width", type=int, default=1920)
-    ap.add_argument("--height", type=int, default=1080)
-    ap.add_argument("--fps", type=int, default=1000, help="render cap; high = run as fast as possible")
-    ap.add_argument("--ipc-port", type=int, default=6001)
-    ap.add_argument("--msg-port", type=int, default=6000)
-    ap.add_argument("--orbit", action="store_true", help="auto-cycle through poses if no client drives the camera")
-    args = ap.parse_args()
-
-    cam_json = args.cameras or os.path.join(args.model, "cameras.json")
-    ply = os.path.join(args.model, "point_cloud", f"iteration_{args.iteration}", "point_cloud.ply")
+    cam_json = cameras or os.path.join(model, "cameras.json")
+    ply = os.path.join(model, "point_cloud", f"iteration_{iteration}", "point_cloud.ply")
     assert os.path.isfile(ply), f"missing {ply}"
 
     logger.info(f"Loading {ply}")
-    gaussians = GaussianModel(args.sh_degree)
+    gaussians = GaussianModel(sh_degree)
     gaussians.load_ply(ply)
     gaussians.active_sh_degree = gaussians.max_sh_degree
     logger.info(f"Loaded {gaussians.get_xyz.shape[0]:,} Gaussians")
 
     bg = torch.zeros(3, dtype=torch.float32, device="cuda")
     pipe = Pipe()
-    cams = load_cams(cam_json, args.width, args.height)
-    logger.info(f"{len(cams)} poses; resolution {args.width}x{args.height}; fps cap {args.fps}")
+    cams = load_cams(cam_json, width, height)
+    logger.info(f"{len(cams)} poses; resolution {width}x{height}; fps cap {fps}")
 
-    ipc_render = splatbus.GaussianSplattingIPCRenderer(
-        width=args.width, height=args.height,
-        ipc_host="0.0.0.0", ipc_port=args.ipc_port,
-        msg_host="0.0.0.0", msg_port=args.msg_port,
-    )
-    ipc_render.init_view(width=args.width, height=args.height, view=cams[0])
-    ipc_render.set_cam_list(width=args.width, height=args.height, views=cams)
+    if handoff_mode == "CUDA-IPC":
+        renderer = splatbus.GaussianSplattingIPCRenderer(
+            width=width, height=height,
+            ipc_host="0.0.0.0", ipc_port=ipc_port,
+            msg_host="0.0.0.0", msg_port=msg_port,
+        )
+    elif handoff_mode == "encoded-stream":
+        renderer = splatbus.GaussianSplattingEncodedStreamRenderer(
+            width=width, height=height,
+            ipc_host="0.0.0.0", ipc_port=ipc_port,
+            msg_host="0.0.0.0", msg_port=msg_port,
+        )
+    else:
+        raise ValueError(f"Invalid handoff mode: {handoff_mode}")
 
-    target_dt = 1.0 / args.fps
+    renderer.init_view(width=width, height=height, view=cams[0])
+    renderer.set_cam_list(width=width, height=height, views=cams)
+
+    target_dt = 1.0 / fps
     frame_idx = 0
     t_report = time.perf_counter()
     n_since = 0
@@ -111,17 +123,17 @@ def main():
         with torch.no_grad():
             while True:
                 t0 = time.clock_gettime(time.CLOCK_MONOTONIC)
-                if args.orbit:
-                    base = splatbus.IPCCamera.init_from_view(args.width, args.height, cams[frame_idx % len(cams)])
+                if orbit:
+                    base = splatbus.IPCCamera.init_from_view(width, height, cams[frame_idx % len(cams)])
                     view = base.cuda()
                 else:
-                    view = ipc_render.get_current_view().cuda()
+                    view = renderer.get_current_view().cuda()
                 t1 = time.clock_gettime(time.CLOCK_MONOTONIC)
-                ipc_render.update_gaussians(gaussians)
+                renderer.update_gaussians(gaussians)
                 t2 = time.clock_gettime(time.CLOCK_MONOTONIC)
                 out = render(view, gaussians, pipe, bg, separate_sh=SEPARATE_SH)
                 t3 = time.clock_gettime(time.CLOCK_MONOTONIC)
-                ipc_render.update_frame(out["render"], out["depth"], frame_idx)
+                renderer.update_frame(out["render"], out["depth"], frame_idx)
                 torch.cuda.synchronize()
                 t4 = time.clock_gettime(time.CLOCK_MONOTONIC)
 
@@ -133,7 +145,7 @@ def main():
                     'renderer_t3': t3,
                     'renderer_t4': t4,
                 }
-                ipc_render.update_frame_info(ts_dict)
+                renderer.update_frame_info(ts_dict)
 
                 frame_idx += 1
                 n_since += 1
@@ -149,8 +161,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("stopping")
     finally:
-        ipc_render.close()
+        renderer.close()
 
 
 if __name__ == "__main__":
-    main()
+    app()

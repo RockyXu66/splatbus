@@ -6,6 +6,7 @@ from .core.ipc_handles import IPCHandleManager
 # from .core.ipc_channel import IPCSocketServer
 # from .core.message_channel import MessageSocketServer
 from .renderer import GaussianSplattingIPCRenderer
+from .renderer import GaussianSplattingEncodedStreamRenderer
 from .client import GaussianSplattingIPCClient
 # from .transform_server import TransformServer
 from .camera import IPCCamera
@@ -18,6 +19,7 @@ __all__ = [
     # 'IPCSocketServer',
     # 'MessageSocketServer',
     'GaussianSplattingIPCRenderer',
+    'GaussianSplattingEncodedStreamRenderer',
     'GaussianSplattingIPCClient',
     # 'TransformServer',
     'IPCCamera',

@@ -105,6 +105,18 @@ class GaussianSplattingIPCClient:
         if not payload_bytes:
             return None
         return json.loads(payload_bytes.decode("utf-8"))
+    
+    def _recv_encoded_frame(self, sock: socket.socket):
+        HEADER = struct.Struct("<IIIQQ")
+        header = self._recv_exact(sock, HEADER.size)
+        if not header:
+            return None
+        (frame_idx, width, height, color_nbytes, depth_nbytes) = HEADER.unpack(header)
+        color_data = self._recv_exact(sock, color_nbytes)
+        depth_data = self._recv_exact(sock, depth_nbytes)
+        if color_data is None or depth_data is None:
+            return None
+        return frame_idx, width, height, color_data, depth_data
 
     def _ipc_listener(self) -> None:
         while not self.stop_event.is_set():
@@ -205,6 +217,42 @@ class GaussianSplattingIPCClient:
             logger.error("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
                 
         return result
+    
+    def receive_encoded_stream(self) -> Dict[str, torch.Tensor]:
+        """
+        Receive latest frame over the CPU-transfer stream.
+
+        Returns dict with 'color' and 'depth' tensors (if available)
+        """
+        result = {}
+
+        payload = {
+            "type": "get_encoded_stream_frame"
+        }
+        if self.msg_sock is None:
+            return result
+
+        try:
+            self._send_json(self.msg_sock, payload)
+            frame = self._recv_encoded_frame(self.msg_sock)  # Wait for response (can be empty)
+        except Exception:
+            frame = None
+
+        if frame is None:
+            return result
+
+        frame_idx, width, height, color_data, depth_data = frame
+        
+        color = np.frombuffer(color_data, dtype=np.float32).reshape(height, width, 4)
+        depth = np.frombuffer(depth_data, dtype=np.float32).reshape(height, width, 1)
+
+        result = {
+            'color': torch.from_numpy(color.copy()).to(device="cuda"),
+            'depth': torch.from_numpy(depth.copy()).to(device="cuda"),
+            'frame_idx': torch.tensor(frame_idx, dtype=torch.int32, device="cuda"),
+        }
+                
+        return result
 
     def get_viewport_size(self) -> Tuple[int, int]:
         """
@@ -280,8 +328,8 @@ class GaussianSplattingIPCClient:
         """
         Receive the frame info from the server.
         """
-        if self.client_buffer_evt is None:
-            logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
+        # if self.client_buffer_evt is None:
+        #     logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
         
         payload = {
             "type": "get_frame_info",

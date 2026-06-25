@@ -1,5 +1,6 @@
 import enum
 import math
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -14,7 +15,10 @@ from rich.console import Console
 from splatbus import GaussianSplattingIPCClient
 from scipy.spatial.transform import Rotation as SciRot
 import time
+from typing import Literal
+import typer
 
+app = typer.Typer()
 console = Console()
 
 from cuda import cudart as cu
@@ -47,9 +51,13 @@ class HistData:
 class RadianceView(mglw.WindowConfig):
     gl_version = (3, 3)
     title = "RadianceViewer"
-    window_size = (400, 400)
+    window_size: tuple[int, int] = (400, 400)
     aspect_ratio = None
-    resizable = True
+    resizable: bool = True
+    ipc_host: str = "127.0.0.1"
+    ipc_port: int = 6001
+    msg_port: int = 6000
+    handoff_mode: Literal["CUDA-IPC", "encoded-stream"] = "CUDA-IPC"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -60,7 +68,7 @@ class RadianceView(mglw.WindowConfig):
             print(f"[BENCH] could not set vsync=False: {e}")
 
         self.client = GaussianSplattingIPCClient(
-            host="127.0.0.1", ipc_port=6001, msg_port=6000
+            host=self.ipc_host, ipc_port=self.ipc_port, msg_port=self.msg_port
         )
         try:
             self.client.connect()
@@ -405,7 +413,7 @@ class RadianceView(mglw.WindowConfig):
         #     self._move_collection_to_cpu()
 
         # Wait for IPC buffers to be initialized before rendering
-        if self.client.client_buffer_color is None:
+        if self.handoff_mode == "CUDA-IPC" and self.client.client_buffer_color is None:
             self.ctx.clear(0.0, 0.0, 0.0, 1.0)
             return
 
@@ -416,7 +424,10 @@ class RadianceView(mglw.WindowConfig):
                 position={k: str(v) for k, v in zip("xyz", t)},
                 rotation={k: str(v) for k, v in zip("xyzw", q)},
             )
-            image = self.client.receive()
+            if self.handoff_mode == "CUDA-IPC":
+                image = self.client.receive()
+            elif self.handoff_mode == "encoded-stream":
+                image = self.client.receive_encoded_stream()
             if "color" not in image:
                 image = {
                     "color": torch.zeros(
@@ -594,10 +605,15 @@ class RadianceView(mglw.WindowConfig):
         self.ctx.viewport = (0, 0, width, height)
         self.imgui.resize(width, height)
 
-
-if __name__ == "__main__":
+@app.command()
+def main(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    ipc_port: int = typer.Option(6001, "--ipc-port"),
+    msg_port: int = typer.Option(6000, "--msg-port"),
+    handoff_mode: Literal["CUDA-IPC", "encoded-stream"] = typer.Option("CUDA-IPC", "--handoff-mode"),
+):
     mglw.setup_basic_logging(20)  # INFO level
-    client = GaussianSplattingIPCClient(host="127.0.0.1", ipc_port=6001, msg_port=6000)
+    client = GaussianSplattingIPCClient(host=host, ipc_port=ipc_port, msg_port=msg_port)
     client.connect()
     width, height = client.get_viewport_size()
     client.close()
@@ -605,8 +621,14 @@ if __name__ == "__main__":
         raise RuntimeError(
             "Could not get width/height from Splatbus. Make sure the renderer is running!"
         )
-
     RadianceView.window_size = (width, height)
     RadianceView.resizable = False
-
+    RadianceView.ipc_host = host
+    RadianceView.ipc_port = ipc_port
+    RadianceView.msg_port = msg_port
+    RadianceView.handoff_mode = handoff_mode
+    sys.argv = sys.argv[:1]
     mglw.run_window_config(RadianceView)
+
+if __name__ == "__main__":
+    app()

@@ -4,7 +4,7 @@ import struct
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from loguru import logger
 
@@ -66,6 +66,13 @@ class BaseSocketServer(threading.Thread, ABC):
             conn = self._conn
         self._send_json(conn, data)
 
+    def send_encoded_frame(self, frame_idx: int, width: int, height: int, color_nbytes: int, depth_nbytes: int, color_data: Any, depth_data: Any):
+        with self._conn_lock:
+            if self._conn is None:
+                raise RuntimeError(f"[{self.server_name}] Client connection is not available.")
+            conn = self._conn
+        self._send_encoded_frame(conn, frame_idx, width, height, color_nbytes, depth_nbytes, color_data, depth_data)
+
     def close_socket(self):
         self._running = False
         try:
@@ -121,6 +128,32 @@ class BaseSocketServer(threading.Thread, ABC):
             # logger.info(f"[{self.server_name}] ✓ Packet sent successfully!")
         except Exception as e:
             logger.info(f"[IPCSocketServer] ✗ Failed to send Packet: {e}")
+            raise
+    
+    def _send_encoded_frame(
+        self, conn: socket.socket, 
+        frame_idx: int, 
+        width: int, 
+        height: int, 
+        color_nbytes: int, 
+        depth_nbytes: int,
+        color_data: Any,
+        depth_data: Any,
+    ):
+        header = struct.pack(
+            '<IIIQQ',
+            frame_idx,
+            width,
+            height,
+            color_nbytes,
+            depth_nbytes,
+        )
+        try:
+            conn.sendall(header)
+            conn.sendall(memoryview(color_data))
+            conn.sendall(memoryview(depth_data))
+        except Exception as e:
+            logger.info(f"[IPCSocketServer] ✗ Failed to send encoded frame: {e}")
             raise
 
     def _recv_exact(self, conn: socket.socket, size: int):

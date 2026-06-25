@@ -1,4 +1,5 @@
 import socket
+import threading
 import warnings
 from collections import OrderedDict
 from typing import Dict, Optional, List
@@ -32,6 +33,12 @@ class MessageSocketServer(BaseSocketServer):
         self.flip_z = flip_z
         self._frame_info_history = OrderedDict()
         self._max_frame_info_history = 100
+
+        # For encoded stream
+        self.es_color_data = None
+        self.es_depth_data = None
+        self.es_frame_idx = None
+        self._encoded_frame_lock = threading.Lock()
         super().__init__(host=host, port=port, server_name="MessageSocketServer")
 
     def on_client_connected(self, conn: socket.socket, addr):
@@ -174,7 +181,37 @@ class MessageSocketServer(BaseSocketServer):
             frame_idx = payload.get("frame_idx", 0)
             ts_dict = self._frame_info_history.get(int(frame_idx))
             self.send_message({"frame_info": ts_dict})
+        elif payload.get("type") == "get_encoded_stream_frame":
+            with self._encoded_frame_lock:
+                if (
+                    self.es_color_data is None
+                    or self.es_depth_data is None
+                    or self.es_frame_idx is None
+                ):
+                    return
+                color_data = self.es_color_data
+                depth_data = self.es_depth_data
+                frame_idx = self.es_frame_idx
+
+            self.send_encoded_frame(
+                frame_idx=frame_idx,
+                width=color_data.shape[1],
+                height=color_data.shape[0],
+                color_nbytes=color_data.nbytes,
+                depth_nbytes=depth_data.nbytes,
+                color_data=color_data,
+                depth_data=depth_data,
+            )
         else:
             logger.debug(
                 f"[MessageSocketServer] Unknown payload type: {payload.get('type')}"
             )
+
+    def update_frame(self, color_data: torch.Tensor, depth_data: torch.Tensor, frame_idx: int = 0):
+        color_snapshot = color_data.contiguous().numpy().copy()
+        depth_snapshot = depth_data.contiguous().numpy().copy()
+
+        with self._encoded_frame_lock:
+            self.es_color_data = color_snapshot
+            self.es_depth_data = depth_snapshot
+            self.es_frame_idx = frame_idx
