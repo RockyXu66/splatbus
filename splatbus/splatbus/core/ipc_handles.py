@@ -7,15 +7,17 @@ from loguru import logger
 class IPCHandleManager:
     """ Manage IPC handles """
 
-    def __init__(self, color_buffer: SharedBuffer, depth_buffer: SharedBuffer) -> None:
+    def __init__(self, color_buffer: SharedBuffer, depth_buffer: SharedBuffer, frame_idx_buffer: SharedBuffer) -> None:
 
         self.color_buffer: SharedBuffer = color_buffer
         self.depth_buffer: SharedBuffer = depth_buffer
+        self.frame_idx_buffer: SharedBuffer = frame_idx_buffer
 
         self.cuda = load_cuda_runtime()
 
         self.mem_handle_color = self._create_memory_handle(self.color_buffer)
         self.mem_handle_depth = self._create_memory_handle(self.depth_buffer)
+        self.mem_handle_frameIdx = self._create_memory_handle(self.frame_idx_buffer)
         self.evt_handle, self.evt_ptr = self._create_event_handle()
 
     def _create_memory_handle(self, buffer: SharedBuffer) -> IpcMem:
@@ -99,5 +101,6 @@ class IPCHandleManager:
         return {
             'mem_handle_color': bytes(self.mem_handle_color.raw),
             'mem_handle_depth': bytes(self.mem_handle_depth.raw),
+            'mem_handle_frameIdx': bytes(self.mem_handle_frameIdx.raw),
             'evt_handle': bytes(self.evt_handle.raw),
         }

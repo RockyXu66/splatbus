@@ -24,6 +24,7 @@ class BaseSocketServer(threading.Thread, ABC):
         self.on_message = on_message
         self.server_name = server_name
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.host, self.port))
         self.sock.listen(1)
@@ -116,9 +117,8 @@ class BaseSocketServer(threading.Thread, ABC):
         json_data = json.dumps(data).encode('utf-8')
 
         try:
-            conn.send(struct.pack('<I', len(json_data)))
-            conn.send(json_data)
-            logger.info(f"[{self.server_name}] ✓ Packet sent successfully!")
+            conn.sendall(struct.pack('<I', len(json_data)) + json_data)
+            # logger.info(f"[{self.server_name}] ✓ Packet sent successfully!")
         except Exception as e:
             logger.info(f"[IPCSocketServer] ✗ Failed to send Packet: {e}")
             raise

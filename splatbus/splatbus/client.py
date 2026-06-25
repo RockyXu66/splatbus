@@ -4,6 +4,7 @@ import socket
 import struct
 import json
 import threading
+import ctypes
 from typing import Optional, Dict, Any, Tuple
 import numpy as np
 from loguru import logger
@@ -34,14 +35,18 @@ class GaussianSplattingIPCClient:
         self.client_buffer_evt = None      # Keep reference to prevent cleanup
         self.client_buffer_color = None
         self.client_buffer_depth = None
+        self.client_buffer_frameIdx = None
         
         self.connected = False
+
+        self.ts_dict = {}
         
     def connect(self):
         """Connect to server"""
         try:
             # Connect IPC socket
             self.ipc_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.ipc_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.ipc_sock.connect((self.host, self.ipc_port))
             logger.info(f"[IPCClient] Connected to IPC {self.host}:{self.ipc_port}")
         except Exception as e:
@@ -59,6 +64,7 @@ class GaussianSplattingIPCClient:
         try:
             # Connect Message socket
             self.msg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.msg_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.msg_sock.connect((self.host, self.msg_port))
             logger.info(f"[IPCClient] Connected to MSG {self.host}:{self.msg_port}")
             
@@ -74,8 +80,7 @@ class GaussianSplattingIPCClient:
             return
         try:
             data = json.dumps(payload).encode("utf-8")
-            sock.sendall(struct.pack("<I", len(data)))
-            sock.sendall(data)
+            sock.sendall(struct.pack("<I", len(data)) + data)
         except Exception as e:
             logger.error(f"[IPCClient] Send failed: {e}")
 
@@ -128,7 +133,8 @@ class GaussianSplattingIPCClient:
                 evt_ptr = cb_evt.evt_ptr
                 # Keep reference to prevent cleanup of event and stream
                 self.client_buffer_evt = cb_evt
-                logger.info(f"[IPCClient] Event handle opened: {hex(evt_ptr.value)}")
+                if evt_ptr is not None and evt_ptr.value is not None:
+                    logger.info(f"[IPCClient] Event handle opened: {hex(evt_ptr.value)}")
         
         # Initialize Color Buffer with shared event
         if "mem_color" in payload:
@@ -136,7 +142,6 @@ class GaussianSplattingIPCClient:
             offset = meta.get("offsetColor", 0)
             success = cb_color.open_mem_handle(payload["mem_color"], meta["w"], meta["h"], 4, offset=offset)
             if success:
-                cb_color.evt_ptr = evt_ptr  # Share the event
                 self.client_buffer_color = cb_color
                 logger.info(f"[IPCClient] Color buffer initialized with event sync (ipc_offset={offset})")
 
@@ -146,9 +151,16 @@ class GaussianSplattingIPCClient:
             offset = meta.get("offsetDepth", 0)
             success = cb_depth.open_mem_handle(payload["mem_depth"], meta["w"], meta["h"], 1, offset=offset)
             if success:
-                cb_depth.evt_ptr = evt_ptr  # Share the event
                 self.client_buffer_depth = cb_depth
                 logger.info(f"[IPCClient] Depth buffer initialized with event sync (ipc_offset={offset})")
+
+        # Initialize Frame Index Buffer with shared event
+        if "mem_frameIdx" in payload:
+            cb_frameIdx = ClientBuffer()
+            offset = meta.get("offsetFrameIdx", 0)
+            success = cb_frameIdx.open_mem_handle(payload["mem_frameIdx"], 1, 1, 1, offset=offset)
+            if success:
+                self.client_buffer_frameIdx = cb_frameIdx
 
     def receive(self) -> Dict[str, torch.Tensor]:
         """
@@ -157,18 +169,40 @@ class GaussianSplattingIPCClient:
         """
         if self.client_buffer_evt is None:
             logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
-        
+
         result = {}
-        
-        if self.client_buffer_color:
-            self.client_buffer_color.read()
-            if self.client_buffer_color.read_buffer is not None:
-                result['color'] = self.client_buffer_color.read_buffer
-                
-        if self.client_buffer_depth:
-            self.client_buffer_depth.read()
-            if self.client_buffer_depth.read_buffer is not None:
-                result['depth'] = self.client_buffer_depth.read_buffer
+
+        buffers = [
+            ("color", self.client_buffer_color, True),
+            ("depth", self.client_buffer_depth, True),
+            ("frame_idx", self.client_buffer_frameIdx, False),
+        ]
+        active_buffers = [(name, buf, flip) for name, buf, flip in buffers if buf is not None]
+
+        if self.client_buffer_evt is not None and self.client_buffer_evt.evt_ptr and self.client_buffer_evt.stream:
+            stream = self.client_buffer_evt.stream
+            ret = self.client_buffer_evt.cuda.cudaStreamWaitEvent(
+                stream,
+                self.client_buffer_evt.evt_ptr,
+                ctypes.c_uint(0),
+            )
+            if ret != 0:
+                logger.error(f"[IPCClient] cudaStreamWaitEvent failed with code {ret}")
+
+            for _, buf, _ in active_buffers:
+                buf.enqueue_read(stream)
+
+            ret = self.client_buffer_evt.cuda.cudaStreamSynchronize(stream)
+            if ret != 0:
+                logger.error(f"[IPCClient] cudaStreamSynchronize failed with code {ret}")
+
+            for name, buf, flip in active_buffers:
+                if buf.read_buffer is not None:
+                    if flip:
+                        buf.read_buffer = torch.flip(buf.read_buffer, dims=[0])
+                    result[name] = buf.read_buffer
+        else:
+            logger.error("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
                 
         return result
 
@@ -241,6 +275,29 @@ class GaussianSplattingIPCClient:
             "rotation": rotation,
         }
         self._send_json(self.msg_sock, payload)
+    
+    def get_frame_info(self, frame_idx: int):
+        """
+        Receive the frame info from the server.
+        """
+        if self.client_buffer_evt is None:
+            logger.warning("[IPCClient] No event synchronization available - reading without sync (may cause race condition)")
+        
+        payload = {
+            "type": "get_frame_info",
+            "frame_idx": frame_idx
+        }
+        try:
+            self._send_json(self.msg_sock, payload)
+            json_msg = self._recv_json(self.msg_sock)  # Wait for response (can be empty)
+        except Exception:
+            json_msg = None
+        default_frame_info = None
+        if json_msg is not None:
+            frame_info = json_msg.get("frame_info", default_frame_info)
+        else:
+            frame_info = default_frame_info
+        return frame_info
 
     def close(self):
         self.connected = False
@@ -250,6 +307,8 @@ class GaussianSplattingIPCClient:
             self.client_buffer_color.close()
         if self.client_buffer_depth:
             self.client_buffer_depth.close()
+        if self.client_buffer_frameIdx:
+            self.client_buffer_frameIdx.close()
         if self.client_buffer_evt:
             self.client_buffer_evt.close()
             

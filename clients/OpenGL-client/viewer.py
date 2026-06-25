@@ -13,6 +13,7 @@ from pyrr import Matrix44, Quaternion, Vector3
 from rich.console import Console
 from splatbus import GaussianSplattingIPCClient
 from scipy.spatial.transform import Rotation as SciRot
+import time
 
 console = Console()
 
@@ -52,6 +53,11 @@ class RadianceView(mglw.WindowConfig):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+        try:
+            self.wnd.vsync = False
+        except Exception as e:
+            print(f"[BENCH] could not set vsync=False: {e}")
 
         self.client = GaussianSplattingIPCClient(
             host="127.0.0.1", ipc_port=6001, msg_port=6000
@@ -153,6 +159,8 @@ class RadianceView(mglw.WindowConfig):
         self.setup_cuda()
         self._frames, self._export_n_frames = [], 500
         self._export_vid = False
+
+        self._viewer_frame_idx = 0
 
     def reset_plot_data(self):
         self.plot_data = {
@@ -389,7 +397,7 @@ class RadianceView(mglw.WindowConfig):
             if self.viewpoint_cam.timestamp > self.time_range[1]:
                 self.viewpoint_cam.timestamp = self.time_range[0]
 
-    def on_render(self, time: float, frame_time: float):
+    def on_render(self, delta_time: float, frame_time: float):
         self.update_controller()
         self._update_timestamp(frame_time)
         # with torch.cuda.stream(self.collection_stream):
@@ -415,8 +423,15 @@ class RadianceView(mglw.WindowConfig):
                         self.height, self.width, 4, dtype=torch.float32, device="cuda"
                     )
                 }
+
+            frame_idx = int(image["frame_idx"])
+            # print(f"frame_idx: {frame_idx}")
+            self.client.ts_dict = self.client.get_frame_info(frame_idx=frame_idx)
+            # print(f"ts_dict: {ts_dict}")
+
             assert image["color"].is_cuda
 
+        t0 = time.clock_gettime(time.CLOCK_MONOTONIC)
         # Map PBO and write data
         (err,) = cu.cudaGraphicsMapResources(1, self.cuda_image, cu.cudaStreamLegacy)
         if err != cu.cudaError_t.cudaSuccess:
@@ -427,7 +442,7 @@ class RadianceView(mglw.WindowConfig):
 
         # Original image was float32 [0.0..1.0]. We scale it to 255 unsigned integer.
         tensor = (image["color"] * 255.0).to(torch.uint8).contiguous()
-               
+
         height = tensor.shape[0]
         width = tensor.shape[1]
         pitch = width * 4
@@ -460,6 +475,12 @@ class RadianceView(mglw.WindowConfig):
         # self.collection_stream.synchronize()
         # self._convert_collection_to_numpy()
         # self.render_ui()
+
+        t1 = time.clock_gettime(time.CLOCK_MONOTONIC)
+        self.client.ts_dict['viewer_t0'] = t0
+        self.client.ts_dict['viewer_t1'] = t1
+
+        self._viewer_frame_idx += 1
 
     def _collect_data_cuda(self):
         raise NotImplementedError("This should be made a SplatBus call.")

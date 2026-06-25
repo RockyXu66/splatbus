@@ -26,6 +26,7 @@ class IPCSocketServer(BaseSocketServer):
         self,
         color_buffer_info: dict,
         depth_buffer_info: dict,
+        frame_idx_buffer_info: dict,
         ipc_handles_info: dict,
         device: Optional[int] = None,
     ):
@@ -37,11 +38,14 @@ class IPCSocketServer(BaseSocketServer):
             "pitchColor": color_buffer_info['pitch'],
             "fmtDepth": depth_buffer_info['format'],
             "pitchDepth": depth_buffer_info['pitch'],
+            "fmtFrameIdx": frame_idx_buffer_info['format'],
+            "pitchFrameIdx": frame_idx_buffer_info['pitch'],
             # Byte offsets from IPC handle base to actual tensor data.
             # PyTorch's caching allocator may place tensors at an offset within
             # a larger cudaMalloc block.
             "offsetColor": int(color_buffer_info.get('ipc_offset', 0)),
             "offsetDepth": int(depth_buffer_info.get('ipc_offset', 0)),
+            "offsetFrameIdx": int(frame_idx_buffer_info.get('ipc_offset', 0)),
         }
         if device is not None:
             meta["device"] = int(device)
@@ -50,6 +54,7 @@ class IPCSocketServer(BaseSocketServer):
             "meta": meta,
             "mem_color": base64.b64encode(bytes(ipc_handles_info['mem_handle_color'])).decode('utf-8'),
             "mem_depth": base64.b64encode(bytes(ipc_handles_info['mem_handle_depth'])).decode('utf-8'),
+            "mem_frameIdx": base64.b64encode(bytes(ipc_handles_info['mem_handle_frameIdx'])).decode('utf-8'),
             "evt_done": base64.b64encode(bytes(ipc_handles_info['evt_handle'])).decode('utf-8')
         }
 

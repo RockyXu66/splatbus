@@ -12,6 +12,7 @@ class ClientBuffer:
         self.cuda = load_cuda_runtime()
         self.dev_ptr = None
         self.evt_ptr = None
+        self.owns_event = False
         self.stream = None
         self.width = 0
         self.height = 0
@@ -56,7 +57,10 @@ class ClientBuffer:
             if ret != 0:
                 logger.error(f"[ClientBuffer] cudaIpcOpenMemHandle failed with code {ret}")
                 return False
-                
+            if dev_ptr.value is None:
+                logger.error("[ClientBuffer] cudaIpcOpenMemHandle returned NULL memory handle")
+                return False
+
             self.dev_ptr = dev_ptr
             
             self.read_buffer = torch.empty((self.height, self.width, self.channels), dtype=torch.float32, device='cuda')
@@ -88,8 +92,12 @@ class ClientBuffer:
             if ret != 0:
                 logger.error(f"[ClientBuffer] cudaIpcOpenEventHandle failed with code {ret}")
                 return False
-                
+            if evt_ptr.value is None:
+                logger.error("[ClientBuffer] cudaIpcOpenEventHandle returned NULL event handle")
+                return False
+
             self.evt_ptr = evt_ptr
+            self.owns_event = True
             
             logger.info(f"[ClientBuffer] Opened handle, evt_ptr: {hex(evt_ptr.value)}")
             return True
@@ -98,29 +106,24 @@ class ClientBuffer:
             logger.error(f"[ClientBuffer] Failed to open handle: {e}")
             return False
 
-    def read(self) -> torch.Tensor:
+
+    def enqueue_read(self, stream_handle=None) -> None:
         """
-        Read data from client buffer to local tensor (read_buffer)
+        Enqueue an async device-to-device copy from the IPC memory into read_buffer.
+
+        The caller owns event waits and stream synchronization. This allows a
+        client to wait once, enqueue color/depth/metadata copies together, then
+        synchronize once so the buffers are behind the same event.
         """
-        if not self.dev_ptr or self.read_buffer is None:
+        if not self.dev_ptr or self.dev_ptr.value is None or self.read_buffer is None:
             raise ValueError("ClientBuffer not initialized")
-        
-        # Wait for renderer to finish writing
-        if self.evt_ptr and self.stream:
-            ret = self.cuda.cudaStreamWaitEvent(
-                self.stream, 
-                self.evt_ptr, 
-                ctypes.c_uint(0)
-            )
-            if ret != 0:
-                logger.error(f"[ClientBuffer] cudaStreamWaitEvent failed with code {ret}")
-        
-        # Async copy from IPC pointer (+ offset) to read_buffer
+
         # cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind, cudaStream_t stream)
         size = self.width * self.height * self.channels * 4  # 4 bytes per float32
         src_ptr = ctypes.c_void_p(self.dev_ptr.value + self.ipc_offset)
+        if stream_handle is None:
+            stream_handle = self.stream if self.stream else ctypes.c_void_p(0)
 
-        stream_handle = self.stream if self.stream else ctypes.c_void_p(0)
         ret = self.cuda.cudaMemcpyAsync(
             ctypes.c_void_p(self.read_buffer.data_ptr()),
             src_ptr,
@@ -128,21 +131,8 @@ class ClientBuffer:
             ctypes.c_int(3),        # cudaMemcpyDeviceToDevice = 3
             stream_handle
         )
-        
         if ret != 0:
             logger.error(f"[ClientBuffer] cudaMemcpyAsync failed with code {ret}")
-        
-        # Synchronize stream to ensure copy is complete before flipping
-        if self.stream:
-            ret = self.cuda.cudaStreamSynchronize(self.stream)
-            if ret != 0:
-                logger.error(f"[ClientBuffer] cudaStreamSynchronize failed with code {ret}")
-        else:
-            # Fallback to device synchronize if no stream
-            self.cuda.cudaDeviceSynchronize()
-
-        # Flip vertically (server sends opengl style image, we need cv2 style image)
-        self.read_buffer = torch.flip(self.read_buffer, dims=[0])
 
     def close(self):
         """Close IPC handle and free resources"""
@@ -156,8 +146,10 @@ class ClientBuffer:
             self.dev_ptr = None
             
         if self.evt_ptr:
-            self.cuda.cudaEventDestroy(self.evt_ptr)
+            if self.owns_event:
+                self.cuda.cudaEventDestroy(self.evt_ptr)
             self.evt_ptr = None
+            self.owns_event = False
         
         # Clear read_buffer
         if self.read_buffer is not None:

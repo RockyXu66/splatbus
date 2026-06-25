@@ -1,5 +1,6 @@
 import socket
 import warnings
+from collections import OrderedDict
 from typing import Dict, Optional, List
 
 import numpy as np
@@ -29,6 +30,8 @@ class MessageSocketServer(BaseSocketServer):
         self.gaussians_rotation_ori = None
         self.flip_y = flip_y
         self.flip_z = flip_z
+        self._frame_info_history = OrderedDict()
+        self._max_frame_info_history = 100
         super().__init__(host=host, port=port, server_name="MessageSocketServer")
 
     def on_client_connected(self, conn: socket.socket, addr):
@@ -132,6 +135,17 @@ class MessageSocketServer(BaseSocketServer):
             gaussians._xyz = tmp_xyz + torch.from_numpy(
                 np.array([pos["x"], pos["y"], pos["z"]])
             ).float().to(gaussians._xyz.device)
+    
+    def update_frame_info(self, ts_dict):
+        frame_info = dict(ts_dict)
+        frame_idx = frame_info.get("frame_idx")
+        if frame_idx is None:
+            return
+
+        self._frame_info_history[int(frame_idx)] = frame_info
+        self._frame_info_history.move_to_end(int(frame_idx))
+        while len(self._frame_info_history) > self._max_frame_info_history:
+            self._frame_info_history.popitem(last=False)
 
     def _handle_payload(self, payload: dict):
         if payload.get("type") == "camera_pose":
@@ -156,6 +170,10 @@ class MessageSocketServer(BaseSocketServer):
                 t = np.array([0.0, 0.0, 0.0])
                 quat = np.array([0.0, 0.0, 0.0, 1.0])
             self.send_message({"position": t.tolist(), "rotation": quat.tolist()})
+        elif payload.get("type") == "get_frame_info":
+            frame_idx = payload.get("frame_idx", 0)
+            ts_dict = self._frame_info_history.get(int(frame_idx))
+            self.send_message({"frame_info": ts_dict})
         else:
             logger.debug(
                 f"[MessageSocketServer] Unknown payload type: {payload.get('type')}"

@@ -43,5 +43,9 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-examples/frames/
+splatbus/examples/frames/
 
+splatbus/examples/cudaMalloc_test_client.py
+splatbus/examples/cudaMalloc_test_server.py
+
+examples/example-bash-scripts/
